@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useReducer, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useReducer, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -22,25 +22,28 @@ import {
   horizontalListSortingStrategy,
   sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
-import { LIMITS, type ServerEvent } from "@collab/shared";
+import { LIMITS, type BoardMember, type ServerEvent, type Viewer } from "@collab/shared";
 import {
-  applyEvent,
   findColumnOf,
+  hasGap,
+  initialSync,
   layoutOf,
   moveCardInLayout,
   moveColumnInLayout,
-  type BoardState,
+  syncReducer,
+  type BoardSync,
   type Layout,
 } from "@/lib/board-state";
 import { RequestError } from "@/lib/sync-client";
-import { useOnConnected, useRequest, useServerEvents, useSyncClient } from "@/lib/sync";
+import { useNotify, useOnConnected, useRequest, useServerEvents, useSyncClient } from "@/lib/sync";
 import { Button, InlineEdit, Input } from "../ui";
 import { BoardColumn, ColumnPreview } from "./board-column";
 import { CardPreview } from "./board-card";
 import { CardDialog } from "./card-dialog";
 import { ShareDialog } from "./share-dialog";
 
-type Loaded = { data: BoardState | null; deleted: boolean };
+/** How long to wait for a missing revision before reloading the board. */
+const GAP_TIMEOUT_MS = 1_500;
 
 type DragItem = { type: "card" | "column"; id: string };
 
@@ -65,29 +68,61 @@ export function BoardView({ boardId }: { boardId: string }) {
   const client = useSyncClient();
   const request = useRequest();
 
-  const [{ data: state, deleted }, dispatch] = useReducer(
-    (s: Loaded, event: ServerEvent): Loaded => {
-      const data = applyEvent(s.data, event, boardId);
-      return data === s.data ? s : { data, deleted: s.data !== null && data === null };
-    },
-    { data: null, deleted: false },
+  const notify = useNotify();
+
+  const [sync, dispatch] = useReducer(
+    (s: BoardSync, event: ServerEvent) => syncReducer(s, event, boardId),
+    initialSync,
   );
+  const { data: state, deleted, viewers } = sync;
   const [loadError, setLoadError] = useState<string | null>(null);
   const [openCardId, setOpenCardId] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
 
-  useServerEvents(dispatch);
+  useServerEvents((event) => {
+    // Someone else deleting the card you're editing closes the editor; say why.
+    if (!event.requestId && openCardId && state) {
+      const gone =
+        (event.type === "card_deleted" && event.cardId === openCardId) ||
+        (event.type === "column_deleted" && state.cards[openCardId]?.columnId === event.columnId);
+      if (gone) notify("Someone else deleted the card you were editing.");
+    }
+    dispatch(event);
+  });
 
-  // (Re)load the whole board every time the connection opens. After a
-  // reconnect this replaces whatever we had with the server's current state.
-  useOnConnected(() => {
+  /** Loads the board and subscribes to its changes. */
+  const load = () => {
     client.request({ type: "open_board", boardId }).then(
       () => setLoadError(null),
       (err: RequestError) => {
         if (err.code !== "disconnected") setLoadError(err.message);
       },
     );
-  });
+  };
+
+  // (Re)load the whole board every time the connection opens. After a
+  // reconnect this replaces whatever we had with the server's current state.
+  useOnConnected(load);
+
+  // Leaving the page: stop receiving this board's changes and presence.
+  useEffect(
+    () => () => {
+      client.request({ type: "close_board", boardId }).catch(() => {
+        // Not connected: the server already dropped the subscription.
+      });
+    },
+    [client, boardId],
+  );
+
+  // A change arrived ahead of one we never got. Give it a moment to show up,
+  // then reload the board rather than stay out of date.
+  const gap = hasGap(sync);
+  const reload = useEffectEvent(load);
+  useEffect(() => {
+    if (!gap) return;
+    const timer = setTimeout(reload, GAP_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [gap]);
 
   // ---- drag and drop ------------------------------------------------------
   //
@@ -254,17 +289,7 @@ export function BoardView({ boardId }: { boardId: string }) {
           className="text-xl font-semibold tracking-tight"
         />
         <div className="ml-auto flex items-center gap-3">
-          <div className="flex -space-x-2" aria-label="Members">
-            {state.members.map((m) => (
-              <span
-                key={m.userId}
-                title={`${m.displayName} (${m.role})`}
-                className="flex size-7 items-center justify-center rounded-full border-2 border-white bg-zinc-200 text-xs font-medium text-zinc-700 dark:border-zinc-950 dark:bg-zinc-700 dark:text-zinc-200"
-              >
-                {m.displayName.slice(0, 1).toUpperCase()}
-              </span>
-            ))}
-          </div>
+          <Presence members={state.members} viewers={viewers} />
           <Button variant="secondary" onClick={() => setSharing(true)}>
             {isOwner ? "Share" : "Members"}
           </Button>
@@ -322,6 +347,45 @@ export function BoardView({ boardId }: { boardId: string }) {
         isOwner={isOwner}
       />
     </main>
+  );
+}
+
+/**
+ * Board members as avatars. People who have the board open right now are
+ * shown in full colour with a green dot; everyone else is dimmed.
+ */
+function Presence({ members, viewers }: { members: BoardMember[]; viewers: Viewer[] }) {
+  const here = new Set(viewers.map((v) => v.userId));
+  const sorted = [...members].sort(
+    (a, b) => Number(here.has(b.userId)) - Number(here.has(a.userId)),
+  );
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-zinc-500" aria-live="polite">
+        {here.size} here now
+      </span>
+      <ul className="flex -space-x-2" aria-label="Members">
+        {sorted.map((m) => {
+          const present = here.has(m.userId);
+          return (
+            <li
+              key={m.userId}
+              title={`${m.displayName} (${m.role})${present ? " · here now" : ""}`}
+              className={`relative flex size-7 items-center justify-center rounded-full border-2 border-white bg-zinc-200 text-xs font-medium text-zinc-700 dark:border-zinc-950 dark:bg-zinc-700 dark:text-zinc-200 ${present ? "" : "opacity-40"}`}
+            >
+              {m.displayName.slice(0, 1).toUpperCase()}
+              {present && (
+                <span
+                  className="absolute -right-0.5 -bottom-0.5 size-2.5 rounded-full border-2 border-white bg-emerald-500 dark:border-zinc-950"
+                  aria-hidden
+                />
+              )}
+              <span className="sr-only">{present ? ", here now" : ""}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }
 

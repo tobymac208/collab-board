@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PROTOCOL_VERSION } from "@collab/shared";
 import { CLOSE_SESSION_ENDED } from "./server.ts";
 import {
   connectClient,
@@ -158,7 +159,11 @@ describe("websocket", () => {
   it("welcomes an authenticated user and answers pings", async () => {
     const { user, cookie } = await signup(server);
     const { ws, next } = await connectClient(server, cookie);
-    expect(await next()).toMatchObject({ type: "welcome", protocolVersion: 2, user });
+    expect(await next()).toMatchObject({
+      type: "welcome",
+      protocolVersion: PROTOCOL_VERSION,
+      user,
+    });
     ws.send(JSON.stringify({ type: "ping", sentAt: 123 }));
     expect(await next()).toMatchObject({ type: "pong", sentAt: 123 });
     ws.close();

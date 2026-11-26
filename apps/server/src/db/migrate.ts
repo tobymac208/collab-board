@@ -1,6 +1,7 @@
 import { Migrator, type Migration, type MigrationProvider } from "kysely/migration";
 import type { DB } from "./schema.ts";
 import * as m0001 from "./migrations/0001_initial.ts";
+import * as m0002 from "./migrations/0002_board_revision.ts";
 
 /**
  * Migrations are registered explicitly rather than read from disk, so they
@@ -8,6 +9,7 @@ import * as m0001 from "./migrations/0001_initial.ts";
  */
 const migrations: Record<string, Migration> = {
   "0001_initial": m0001,
+  "0002_board_revision": m0002,
 };
 
 const provider: MigrationProvider = { getMigrations: async () => migrations };

@@ -26,6 +26,8 @@ export interface BoardsTable {
   id: Generated<string>;
   name: string;
   created_by: string;
+  /** Incremented by every change to the board, in the same transaction. */
+  revision: ColumnType<number, never, number>;
   created_at: CreatedAt;
   updated_at: Timestamp;
 }

@@ -89,6 +89,11 @@ function useSyncContext(): SyncContextValue {
   return ctx;
 }
 
+/** Shows a short message to the user (the same toast that reports errors). */
+export function useNotify(): (message: string) => void {
+  return useSyncContext().reportError;
+}
+
 /** The raw client, for callers that handle request errors themselves. */
 export function useSyncClient(): SyncClient {
   return useSyncContext().client;

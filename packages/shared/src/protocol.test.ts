@@ -82,7 +82,29 @@ describe("parseServerMessage", () => {
       description: "",
       position: "a0",
     };
-    expect(parseServerMessage(raw({ type: "card_upserted", card })).ok).toBe(true);
+    expect(parseServerMessage(raw({ type: "card_upserted", card, revision: 4 })).ok).toBe(true);
+  });
+
+  it("requires a revision on board changes", () => {
+    const card = {
+      id: "c1",
+      boardId: "b1",
+      columnId: "col1",
+      title: "t",
+      description: "",
+      position: "a0",
+    };
+    expect(parseServerMessage(raw({ type: "card_upserted", card })).ok).toBe(false);
+    expect(parseServerMessage(raw({ type: "card_upserted", card, revision: -1 })).ok).toBe(false);
+  });
+
+  it("accepts presence updates", () => {
+    const msg = {
+      type: "presence",
+      boardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
+      viewers: [{ userId: "u1", displayName: "Ada" }],
+    };
+    expect(parseServerMessage(raw(msg))).toEqual({ ok: true, value: msg });
   });
 });
 

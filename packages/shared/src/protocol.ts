@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { BoardMember, BoardSummary, Card, Column, User, fields } from "./model.ts";
+import { BoardMember, BoardSummary, Card, Column, User, Viewer, fields } from "./model.ts";
 
 /**
  * Wire protocol between the browser and the WebSocket server.
@@ -12,9 +12,20 @@ import { BoardMember, BoardSummary, Card, Column, User, fields } from "./model.t
  * with zero or more state events (`board_snapshot`, `card_upserted`, ...)
  * followed by exactly one `ack` or `error`, all carrying the same `requestId`.
  * Clients apply state events as they arrive; the ack signals completion.
+ *
+ * Real time: a socket that opens a board (`open_board`) receives everyone
+ * else's changes to it as the same state events, without a `requestId`,
+ * until it sends `close_board`, opens another board, or disconnects.
+ * Board-list changes (`board_upserted`, `board_deleted`) go to every member.
+ *
+ * Ordering: every change to a board increments its `revision`, and each
+ * board event carries the revision it produced. Events can arrive out of
+ * order, so clients apply them in revision order: ignore revisions they've
+ * already seen, hold back early ones until the gap fills, and reload the
+ * board if it doesn't.
  */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // ---- client -> server ----------------------------------------------------
 
@@ -34,7 +45,10 @@ export const ClientMessage = z.discriminatedUnion("type", [
   request("create_board", { name: fields.boardName }),
   request("rename_board", { boardId: fields.id, name: fields.boardName }),
   request("delete_board", { boardId: fields.id }),
+  /** Loads a board and subscribes to its changes and presence. */
   request("open_board", { boardId: fields.id }),
+  /** Stops receiving a board's changes (e.g. on navigating away). */
+  request("close_board", { boardId: fields.id }),
   request("add_member", { boardId: fields.id, email: fields.email }),
 
   request("create_column", { boardId: fields.id, name: fields.columnName }),
@@ -80,24 +94,34 @@ export type ErrorCode = z.infer<typeof ErrorCode>;
 const event = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) =>
   z.object({ type: z.literal(type), requestId: requestId.optional(), ...shape });
 
+/** The board revision an event produced (or, for a snapshot, reflects). */
+const revision = z.number().int().min(0);
+
 export const ServerEvent = z.discriminatedUnion("type", [
   event("board_list", { boards: z.array(BoardSummary) }),
-  event("board_upserted", { board: BoardSummary }),
+  /** `board.role` is always the receiving user's own role. */
+  event("board_upserted", { board: BoardSummary, revision }),
   event("board_deleted", { boardId: fields.id }),
   event("board_snapshot", {
     board: BoardSummary,
+    revision,
     members: z.array(BoardMember),
     columns: z.array(Column),
     cards: z.array(Card),
   }),
-  event("member_added", { boardId: fields.id, member: BoardMember }),
-  event("column_upserted", { column: Column }),
+  event("member_added", { boardId: fields.id, revision, member: BoardMember }),
+  event("column_upserted", { column: Column, revision }),
   /** Deleting a column also deletes every card in it. */
-  event("column_deleted", { boardId: fields.id, columnId: fields.id }),
-  event("card_upserted", { card: Card }),
-  event("card_deleted", { boardId: fields.id, cardId: fields.id }),
+  event("column_deleted", { boardId: fields.id, columnId: fields.id, revision }),
+  event("card_upserted", { card: Card, revision }),
+  event("card_deleted", { boardId: fields.id, cardId: fields.id, revision }),
+  /** Who has the board open right now, one entry per person. Not revisioned. */
+  event("presence", { boardId: fields.id, viewers: z.array(Viewer) }),
 ]);
 export type ServerEvent = z.infer<typeof ServerEvent>;
+
+/** Events that change a board's state and carry a revision. */
+export type BoardChangeEvent = Extract<ServerEvent, { revision: number }>;
 
 export const ServerMessage = z.discriminatedUnion("type", [
   z.object({

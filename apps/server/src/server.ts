@@ -22,6 +22,7 @@ import {
   createSession,
   deleteSession,
   findSession,
+  activeSessionIds,
   isSessionActive,
   readCookie,
   sessionCookie,
@@ -30,6 +31,7 @@ import {
 import { EmailTakenError, authenticate, createUser } from "./auth/users.ts";
 import { StoreError } from "./boards/store.ts";
 import { handleRequest } from "./ws/handlers.ts";
+import { Hub } from "./ws/hub.ts";
 
 export const WS_PATH = "/ws";
 
@@ -39,6 +41,14 @@ export const CLOSE_SESSION_ENDED = 4001;
 const MAX_BODY_BYTES = 16 * 1024;
 /** Requests a single socket may have queued before we assume it's misbehaving. */
 const MAX_PENDING_REQUESTS = 100;
+
+export interface AppServerOptions {
+  /**
+   * How often to check that the sessions behind open sockets are still valid,
+   * so idle sockets stop receiving broadcasts once their session ends.
+   */
+  sessionCheckIntervalMs?: number;
+}
 
 function send(socket: WebSocket, message: ServerMessage): void {
   if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message));
@@ -93,9 +103,12 @@ async function readJson<T>(req: IncomingMessage, schema: z.ZodType<T>): Promise<
 export function createAppServer(
   config: ServerConfig,
   db: DB,
-): { http: Server; wss: WebSocketServer } {
+  { sessionCheckIntervalMs = 60_000 }: AppServerOptions = {},
+): { http: Server; wss: WebSocketServer; hub: Hub } {
   const isAllowedOrigin = (origin: string | undefined) =>
     config.allowedOrigins.length === 0 || (!!origin && config.allowedOrigins.includes(origin));
+
+  const hub = new Hub();
 
   /** Open sockets per session, so logging out also disconnects them. */
   const socketsBySession = new Map<string, Set<WebSocket>>();
@@ -243,7 +256,9 @@ export function createAppServer(
     const sessionSockets = socketsBySession.get(session.id) ?? new Set();
     sessionSockets.add(socket);
     socketsBySession.set(session.id, sessionSockets);
+    hub.add(socket, session.user);
     socket.on("close", () => {
+      hub.remove(socket);
       sessionSockets.delete(socket);
       if (sessionSockets.size === 0) socketsBySession.delete(session.id);
     });
@@ -285,7 +300,7 @@ export function createAppServer(
           socket.close(CLOSE_SESSION_ENDED, "session ended");
           return;
         }
-        const events = await handleRequest(db, session.user, msg);
+        const events = await handleRequest({ db, hub, user: session.user, socket }, msg);
         for (const event of events) send(socket, { ...event, requestId: msg.requestId });
         send(socket, { type: "ack", requestId: msg.requestId });
       } catch (err) {
@@ -334,5 +349,30 @@ export function createAppServer(
     });
   });
 
-  return { http, wss };
+  // ---- ending sessions on idle sockets ------------------------------------
+  //
+  // Requests recheck the session, but a socket that only listens would keep
+  // receiving board broadcasts after its session expired or was deleted
+  // elsewhere. Check every connected session periodically, in one query.
+
+  async function closeEndedSessions(): Promise<void> {
+    const checked = [...socketsBySession.keys()];
+    const active = await activeSessionIds(db, checked);
+    // Only act on sessions we asked about; new ones may have connected meanwhile.
+    for (const sessionId of checked) {
+      if (active.has(sessionId)) continue;
+      for (const socket of socketsBySession.get(sessionId) ?? []) {
+        hub.remove(socket); // stop broadcasts now, not after the close handshake
+        socket.close(CLOSE_SESSION_ENDED, "session ended");
+      }
+    }
+  }
+
+  const sessionCheck = setInterval(() => {
+    closeEndedSessions().catch((err: unknown) => console.error("session check failed", err));
+  }, sessionCheckIntervalMs);
+  sessionCheck.unref();
+  http.on("close", () => clearInterval(sessionCheck));
+
+  return { http, wss, hub };
 }

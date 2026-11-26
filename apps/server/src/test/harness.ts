@@ -10,7 +10,7 @@ import {
   type User,
 } from "@collab/shared";
 import type { DB } from "../db/schema.ts";
-import { createAppServer, WS_PATH } from "../server.ts";
+import { createAppServer, WS_PATH, type AppServerOptions } from "../server.ts";
 import { createTestDb } from "./pglite.ts";
 
 export interface TestServer {
@@ -37,8 +37,16 @@ export function useTestDb(): () => DB {
   return () => db!;
 }
 
-export async function startServer(db: DB, allowedOrigins: string[] = []): Promise<TestServer> {
-  const { http, wss } = createAppServer({ port: 0, allowedOrigins, cookieSecure: false }, db);
+export async function startServer(
+  db: DB,
+  allowedOrigins: string[] = [],
+  options: AppServerOptions = {},
+): Promise<TestServer> {
+  const { http, wss } = createAppServer(
+    { port: 0, allowedOrigins, cookieSecure: false },
+    db,
+    options,
+  );
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
   const { port } = http.address() as AddressInfo;
   return {
@@ -86,6 +94,12 @@ export interface TestClient {
   next: () => Promise<ServerMessage>;
   /** Sends a request and resolves with its events once acked; rejects on error. */
   request: (body: ClientRequestBody) => Promise<ServerEvent[]>;
+  /**
+   * Everything queued for this client right now: pings the server and
+   * collects messages until the pong. A socket's messages arrive in send
+   * order, so anything broadcast before the ping is included.
+   */
+  drain: () => Promise<ServerMessage[]>;
   close: () => void;
 }
 
@@ -150,7 +164,19 @@ export async function connectClient(
       ws.send(JSON.stringify({ ...body, requestId }));
     });
 
-  return { ws, next, request, close: () => ws.close() };
+  let pingCounter = 0;
+  const drain = async (): Promise<ServerMessage[]> => {
+    const sentAt = -++pingCounter; // negative, so it can't match a real timestamp
+    ws.send(JSON.stringify({ type: "ping", sentAt }));
+    const seen: ServerMessage[] = [];
+    for (;;) {
+      const msg = await next();
+      if (msg.type === "pong" && msg.sentAt === sentAt) return seen;
+      seen.push(msg);
+    }
+  };
+
+  return { ws, next, request, drain, close: () => ws.close() };
 }
 
 /** Connects and consumes the welcome message. */
