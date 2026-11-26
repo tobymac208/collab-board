@@ -54,6 +54,18 @@ export async function isSessionActive(db: DB, sessionId: string): Promise<boolea
   return row !== undefined;
 }
 
+/** Which of these session ids still exist and haven't expired, in one query. */
+export async function activeSessionIds(db: DB, sessionIds: string[]): Promise<Set<string>> {
+  if (sessionIds.length === 0) return new Set();
+  const rows = await db
+    .selectFrom("sessions")
+    .select("id")
+    .where("id", "in", sessionIds)
+    .where("expires_at", ">", new Date())
+    .execute();
+  return new Set(rows.map((r) => r.id));
+}
+
 export async function deleteSession(db: DB, token: string): Promise<string> {
   const id = hashToken(token);
   await db.deleteFrom("sessions").where("id", "=", id).execute();

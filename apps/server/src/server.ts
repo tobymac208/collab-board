@@ -22,6 +22,7 @@ import {
   createSession,
   deleteSession,
   findSession,
+  activeSessionIds,
   isSessionActive,
   readCookie,
   sessionCookie,
@@ -40,6 +41,14 @@ export const CLOSE_SESSION_ENDED = 4001;
 const MAX_BODY_BYTES = 16 * 1024;
 /** Requests a single socket may have queued before we assume it's misbehaving. */
 const MAX_PENDING_REQUESTS = 100;
+
+export interface AppServerOptions {
+  /**
+   * How often to check that the sessions behind open sockets are still valid,
+   * so idle sockets stop receiving broadcasts once their session ends.
+   */
+  sessionCheckIntervalMs?: number;
+}
 
 function send(socket: WebSocket, message: ServerMessage): void {
   if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message));
@@ -94,6 +103,7 @@ async function readJson<T>(req: IncomingMessage, schema: z.ZodType<T>): Promise<
 export function createAppServer(
   config: ServerConfig,
   db: DB,
+  { sessionCheckIntervalMs = 60_000 }: AppServerOptions = {},
 ): { http: Server; wss: WebSocketServer; hub: Hub } {
   const isAllowedOrigin = (origin: string | undefined) =>
     config.allowedOrigins.length === 0 || (!!origin && config.allowedOrigins.includes(origin));
@@ -338,6 +348,31 @@ export function createAppServer(
         });
     });
   });
+
+  // ---- ending sessions on idle sockets ------------------------------------
+  //
+  // Requests recheck the session, but a socket that only listens would keep
+  // receiving board broadcasts after its session expired or was deleted
+  // elsewhere. Check every connected session periodically, in one query.
+
+  async function closeEndedSessions(): Promise<void> {
+    const checked = [...socketsBySession.keys()];
+    const active = await activeSessionIds(db, checked);
+    // Only act on sessions we asked about; new ones may have connected meanwhile.
+    for (const sessionId of checked) {
+      if (active.has(sessionId)) continue;
+      for (const socket of socketsBySession.get(sessionId) ?? []) {
+        hub.remove(socket); // stop broadcasts now, not after the close handshake
+        socket.close(CLOSE_SESSION_ENDED, "session ended");
+      }
+    }
+  }
+
+  const sessionCheck = setInterval(() => {
+    closeEndedSessions().catch((err: unknown) => console.error("session check failed", err));
+  }, sessionCheckIntervalMs);
+  sessionCheck.unref();
+  http.on("close", () => clearInterval(sessionCheck));
 
   return { http, wss, hub };
 }

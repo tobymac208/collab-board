@@ -10,7 +10,7 @@ import {
   type User,
 } from "@collab/shared";
 import type { DB } from "../db/schema.ts";
-import { createAppServer, WS_PATH } from "../server.ts";
+import { createAppServer, WS_PATH, type AppServerOptions } from "../server.ts";
 import { createTestDb } from "./pglite.ts";
 
 export interface TestServer {
@@ -37,8 +37,16 @@ export function useTestDb(): () => DB {
   return () => db!;
 }
 
-export async function startServer(db: DB, allowedOrigins: string[] = []): Promise<TestServer> {
-  const { http, wss } = createAppServer({ port: 0, allowedOrigins, cookieSecure: false }, db);
+export async function startServer(
+  db: DB,
+  allowedOrigins: string[] = [],
+  options: AppServerOptions = {},
+): Promise<TestServer> {
+  const { http, wss } = createAppServer(
+    { port: 0, allowedOrigins, cookieSecure: false },
+    db,
+    options,
+  );
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
   const { port } = http.address() as AddressInfo;
   return {

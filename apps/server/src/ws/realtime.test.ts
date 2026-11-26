@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ServerMessage } from "@collab/shared";
+import { CLOSE_SESSION_ENDED } from "../server.ts";
 import {
   login,
   only,
@@ -267,6 +268,35 @@ describe("presence", () => {
     await owner.client.drain();
     await open(editor.client, other.id);
     expect(names(await owner.client.drain())).toEqual([owner.user.displayName]);
+  });
+});
+
+describe("session expiry", () => {
+  it("disconnects idle sockets whose session ended, and stops broadcasting to them", async () => {
+    await server.close();
+    server = await startServer(getDb(), [], { sessionCheckIntervalMs: 50 });
+    const { owner, editor, board } = await sharedBoard();
+    const snap = await open(owner.client, board.id);
+    await open(editor.client, board.id);
+    await editor.client.drain();
+
+    // Record everything the editor receives from here on, without sending anything.
+    const received: string[] = [];
+    editor.client.ws.on("message", (data) => received.push(JSON.parse(data.toString()).type));
+    const closed = new Promise<number>((resolve) => editor.client.ws.on("close", resolve));
+
+    await server.db
+      .updateTable("sessions")
+      .set({ expires_at: new Date(0) })
+      .where("user_id", "=", editor.user.id)
+      .execute();
+    expect(await closed).toBe(CLOSE_SESSION_ENDED);
+
+    await owner.client.request({ type: "create_card", columnId: snap.columns[0]!.id, title: "x" });
+    expect(received.filter((t) => t !== "presence")).toEqual([]);
+    // The owner's session is fine: still connected, and the editor has left.
+    const presence = (await owner.client.drain()).filter((m) => m.type === "presence").at(-1);
+    expect(presence).toMatchObject({ viewers: [{ userId: owner.user.id }] });
   });
 });
 
