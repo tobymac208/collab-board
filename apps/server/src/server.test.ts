@@ -191,6 +191,30 @@ describe("websocket", () => {
     expect(await closed).toBe(CLOSE_SESSION_ENDED);
   });
 
+  it.each([
+    ["deleted without a logout", () => server.db.deleteFrom("sessions").execute()],
+    [
+      "expired",
+      () =>
+        server.db
+          .updateTable("sessions")
+          .set({ expires_at: new Date(0) })
+          .execute(),
+    ],
+  ])("stops serving requests once the session is %s", async (_label, endSession) => {
+    const { cookie } = await signup(server);
+    const client = await login(server, cookie);
+    const closed = new Promise<number>((resolve) => client.ws.on("close", resolve));
+    await endSession();
+
+    // Several queued requests: none of them may run.
+    for (let i = 0; i < 3; i++) {
+      client.ws.send(JSON.stringify({ type: "create_board", requestId: `r${i}`, name: `b${i}` }));
+    }
+    expect(await closed).toBe(CLOSE_SESSION_ENDED);
+    expect(await server.db.selectFrom("boards").select("id").execute()).toHaveLength(0);
+  });
+
   it("answers requests in the order they were sent", async () => {
     const { cookie } = await signup(server);
     const client = await login(server, cookie);

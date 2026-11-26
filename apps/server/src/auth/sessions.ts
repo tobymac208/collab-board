@@ -43,6 +43,17 @@ export async function findSession(db: DB, token: string): Promise<Session | null
   };
 }
 
+/** Whether a session (by its stored id) still exists and hasn't expired. */
+export async function isSessionActive(db: DB, sessionId: string): Promise<boolean> {
+  const row = await db
+    .selectFrom("sessions")
+    .select("id")
+    .where("id", "=", sessionId)
+    .where("expires_at", ">", new Date())
+    .executeTakeFirst();
+  return row !== undefined;
+}
+
 export async function deleteSession(db: DB, token: string): Promise<string> {
   const id = hashToken(token);
   await db.deleteFrom("sessions").where("id", "=", id).execute();

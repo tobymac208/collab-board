@@ -22,6 +22,7 @@ import {
   createSession,
   deleteSession,
   findSession,
+  isSessionActive,
   readCookie,
   sessionCookie,
   type Session,
@@ -254,7 +255,11 @@ export function createAppServer(
       user: session.user,
     });
 
+    /** Set once the session has ended; queued messages are then dropped. */
+    let sessionEnded = false;
+
     async function handleMessage(raw: string): Promise<void> {
+      if (sessionEnded) return;
       const parsed = parseClientMessage(raw);
       if (!parsed.ok) {
         const requestId = salvageRequestId(raw);
@@ -272,6 +277,14 @@ export function createAppServer(
         return;
       }
       try {
+        // The cookie was checked at upgrade time, but the session may since
+        // have expired or been deleted (by a logout this server didn't see,
+        // say). Recheck before every request that touches data.
+        if (!(await isSessionActive(db, session.id))) {
+          sessionEnded = true;
+          socket.close(CLOSE_SESSION_ENDED, "session ended");
+          return;
+        }
         const events = await handleRequest(db, session.user, msg);
         for (const event of events) send(socket, { ...event, requestId: msg.requestId });
         send(socket, { type: "ack", requestId: msg.requestId });
