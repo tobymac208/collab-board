@@ -217,16 +217,20 @@ export async function createBoard(
   });
 }
 
-/** Returns the new name; each member sees it with their own role. */
+/**
+ * Renames the board. Also returns its members and their roles, read in the
+ * same transaction, so the caller can tell each of them (with their own role)
+ * without a second query that could fail after the rename committed.
+ */
 export async function renameBoard(
   db: DB,
   userId: string,
   boardId: string,
   name: string,
-): Promise<Revisioned<string>> {
+): Promise<Revisioned<{ name: string; members: { userId: string; role: BoardRole }[] }>> {
   return writeBoard(db, userId, boardId, { owner: true }, async (trx) => {
     await trx.updateTable("boards").set({ name }).where("id", "=", boardId).execute();
-    return name;
+    return { name, members: await listMemberRoles(trx, boardId) };
   });
 }
 

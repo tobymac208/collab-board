@@ -41,9 +41,10 @@ export async function handleRequest(
     }
 
     case "rename_board": {
-      const { value: name, revision } = await store.renameBoard(db, uid, msg.boardId, msg.name);
+      const { value, revision } = await store.renameBoard(db, uid, msg.boardId, msg.name);
+      const { name } = value;
       // Board lists and open boards alike; each member sees their own role.
-      for (const member of await store.listMemberRoles(db, msg.boardId)) {
+      for (const member of value.members) {
         hub.toUser(
           member.userId,
           {
