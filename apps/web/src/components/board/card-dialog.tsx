@@ -5,17 +5,31 @@ import { LIMITS, type Card, type CardField, type Viewer } from "@collab/shared";
 import { Button, Input, Modal, Textarea } from "../ui";
 import { useBoard } from "./board-context";
 
-export function CardDialog({ card, onClose }: { card: Card | undefined; onClose: () => void }) {
+/** A field the user has edited: their text, and the card version they started from. */
+type Draft = { value: string; baseVersion: number };
+
+/** Reopening an edit that was refused (e.g. made offline, then clashed). */
+export interface CardResume {
+  drafts: Partial<Record<CardField, Draft>>;
+  conflicts: CardField[];
+}
+
+export function CardDialog({
+  card,
+  resume,
+  onClose,
+}: {
+  card: Card | undefined;
+  resume?: CardResume | undefined;
+  onClose: () => void;
+}) {
   return (
     <Modal open={card !== undefined} onClose={onClose} title="Edit card">
       {/* Keyed so the form resets when a different card opens. */}
-      {card && <CardForm key={card.id} card={card} onClose={onClose} />}
+      {card && <CardForm key={card.id} card={card} resume={resume} onClose={onClose} />}
     </Modal>
   );
 }
-
-/** A field the user has edited: their text, and the card version they started from. */
-type Draft = { value: string; baseVersion: number };
 
 const LABELS: Record<CardField, string> = { title: "title", description: "description" };
 
@@ -26,10 +40,18 @@ const LABELS: Record<CardField, string> = { title: "title", description: "descri
  * from. Saving sends only your fields with those versions; if someone else
  * changed one of them meanwhile, the server says so and you choose.
  */
-function CardForm({ card, onClose }: { card: Card; onClose: () => void }) {
+function CardForm({
+  card,
+  resume,
+  onClose,
+}: {
+  card: Card;
+  resume?: CardResume | undefined;
+  onClose: () => void;
+}) {
   const { mutate, othersOnCard } = useBoard();
-  const [drafts, setDrafts] = useState<Partial<Record<CardField, Draft>>>({});
-  const [conflicts, setConflicts] = useState<CardField[]>([]);
+  const [drafts, setDrafts] = useState<Partial<Record<CardField, Draft>>>(resume?.drafts ?? {});
+  const [conflicts, setConflicts] = useState<CardField[]>(resume?.conflicts ?? []);
   const [saving, setSaving] = useState(false);
 
   const valueOf = (field: CardField) => drafts[field]?.value ?? card[field];
@@ -148,7 +170,7 @@ function CardForm({ card, onClose }: { card: Card; onClose: () => void }) {
             type="submit"
             disabled={saving || conflicts.length > 0 || !valueOf("title").trim()}
           >
-            Save
+            {saving ? "Saving…" : "Save"}
           </Button>
         </div>
       </div>

@@ -6,6 +6,7 @@ import {
   type BoardMember,
   type BoardSummary,
   type Card,
+  type CardField,
   type ClientRequestBody,
   type Column,
   type ServerEvent,
@@ -40,6 +41,8 @@ export interface BoardSync {
   deleted: boolean;
   /** This client's own changes the server hasn't confirmed yet (see `viewOf`). */
   ops: LocalOp[];
+  /** Changes made offline that the server refused once we reconnected. */
+  rejected: RejectedOp[];
 }
 
 export const initialSync: BoardSync = {
@@ -48,6 +51,7 @@ export const initialSync: BoardSync = {
   viewers: [],
   deleted: false,
   ops: [],
+  rejected: [],
 };
 
 // ---- optimistic updates --------------------------------------------------
@@ -80,17 +84,38 @@ export type BoardOp = Extract<
 >;
 
 export interface LocalOp {
-  key: number;
   op: BoardOp;
   /** Set when the server accepted it: the revision its reply produced. */
   confirmedAt?: number;
+  /**
+   * Made while offline, or interrupted by a disconnect. If the server later
+   * refuses it, it goes to the review list instead of a passing error toast,
+   * since the user may have long moved on.
+   */
+  deferred?: boolean;
+}
+
+/** An offline change the server refused, kept so the user can review it. */
+export interface RejectedOp {
+  op: BoardOp;
+  code: string;
+  message: string;
+  conflictingFields: CardField[];
 }
 
 export type BoardAction =
   | { kind: "event"; event: ServerEvent }
-  | { kind: "op_started"; key: number; op: BoardOp }
-  | { kind: "op_confirmed"; key: number; revision: number }
-  | { kind: "op_failed"; key: number };
+  | { kind: "op_started"; op: BoardOp; deferred: boolean }
+  | { kind: "op_confirmed"; opId: string; revision: number }
+  /** Refused while the user was there to see it: roll back. */
+  | { kind: "op_failed"; opId: string }
+  /** Lost its connection before the server answered: will be resent. */
+  | { kind: "op_deferred"; opId: string }
+  /** A deferred change was refused: roll back and keep it for review. */
+  | { kind: "op_rejected"; opId: string; error: Omit<RejectedOp, "op"> }
+  | { kind: "rejected_dismissed"; opId: string }
+  /** State saved in the browser, loaded when the board opens. */
+  | { kind: "restored"; data: BoardState | null; ops: LocalOp[]; rejected: RejectedOp[] };
 
 const sortedCards = (state: BoardState, columnId: string, except?: string) =>
   Object.values(state.cards)
@@ -201,22 +226,68 @@ function pruneOps(sync: BoardSync): BoardSync {
 
 /** The board reducer: server events plus the lifecycle of our own changes. */
 export function boardReducer(sync: BoardSync, action: BoardAction, boardId: string): BoardSync {
+  const withoutOp = (opId: string) => sync.ops.filter((o) => o.op.opId !== opId);
   switch (action.kind) {
     case "event":
       return pruneOps(syncReducer(sync, action.event, boardId));
     case "op_started":
-      return { ...sync, ops: [...sync.ops, { key: action.key, op: action.op }] };
+      return {
+        ...sync,
+        ops: [...sync.ops, { op: action.op, ...(action.deferred ? { deferred: true } : {}) }],
+      };
     case "op_confirmed":
       return pruneOps({
         ...sync,
         ops: sync.ops.map((o) =>
-          o.key === action.key ? { ...o, confirmedAt: action.revision } : o,
+          o.op.opId === action.opId ? { ...o, confirmedAt: action.revision } : o,
         ),
       });
     case "op_failed":
-      return { ...sync, ops: sync.ops.filter((o) => o.key !== action.key) };
+      return { ...sync, ops: withoutOp(action.opId) };
+    case "op_deferred":
+      return {
+        ...sync,
+        ops: sync.ops.map((o) => (o.op.opId === action.opId ? { ...o, deferred: true } : o)),
+      };
+    case "op_rejected": {
+      const local = sync.ops.find((o) => o.op.opId === action.opId);
+      if (!local) return sync;
+      return {
+        ...sync,
+        ops: withoutOp(action.opId),
+        rejected: [...sync.rejected, { op: local.op, ...action.error }],
+      };
+    }
+    case "rejected_dismissed":
+      return { ...sync, rejected: sync.rejected.filter((r) => r.op.opId !== action.opId) };
+    case "restored": {
+      // Saved state is older than anything we've received since, so it only
+      // fills gaps: keep newer board data, and put saved changes first (they
+      // were made earlier) without duplicating any we already have.
+      const data =
+        sync.data && (!action.data || sync.data.revision >= action.data.revision)
+          ? sync.data
+          : action.data;
+      const known = new Set(sync.ops.map((o) => o.op.opId));
+      const knownRejected = new Set(sync.rejected.map((r) => r.op.opId));
+      return pruneOps({
+        ...sync,
+        data,
+        ops: [
+          ...action.ops.filter((o) => !known.has(o.op.opId)).map((o) => ({ ...o, deferred: true })),
+          ...sync.ops,
+        ],
+        rejected: [
+          ...action.rejected.filter((r) => !knownRejected.has(r.op.opId)),
+          ...sync.rejected,
+        ],
+      });
+    }
   }
 }
+
+/** Our changes the server hasn't accepted yet (still to send, or in flight). */
+export const unsentOps = (sync: BoardSync) => sync.ops.filter((o) => o.confirmedAt === undefined);
 
 const byId = <T extends { id: string }>(items: T[]): Record<string, T> =>
   Object.fromEntries(items.map((item) => [item.id, item]));

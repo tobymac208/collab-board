@@ -3,6 +3,7 @@ import {
   initialPositions,
   positionAtEnd,
   positionBetweenNeighbours,
+  type BoardChangeEvent,
   type BoardMember,
   type BoardRole,
   type BoardSummary,
@@ -17,10 +18,12 @@ import type { DB } from "../db/schema.ts";
  * and checks their membership before touching data, so callers can't forget.
  *
  * Writes: every change to a board goes through `writeBoard`, which locks the
- * board row, applies the change and increments `boards.revision` in one
- * transaction. The lock queues concurrent writes to the same board one at a
- * time, so revisions are gap-free and follow commit order, and two writers
- * can never pick the same position key.
+ * board row, applies the change, increments `boards.revision`, and logs the
+ * resulting event in one transaction. The lock queues concurrent writes to
+ * the same board one at a time, so revisions are gap-free and follow commit
+ * order, and two writers can never pick the same position key. The log lets
+ * reconnecting clients catch up; client changes carry an opId so a resent
+ * change is applied only once.
  *
  * Ordering: columns and cards carry fractional index keys, so a move writes
  * only the moved row. Moves name the neighbours the user dropped the item
@@ -42,13 +45,6 @@ export class StoreError extends Error {
   ) {
     super(message);
   }
-}
-
-/** The result of a write, plus the board revision it produced. */
-export interface Revisioned<T> {
-  value: T;
-  boardId: string;
-  revision: number;
 }
 
 const DEFAULT_COLUMNS = ["To do", "In progress", "Done"];
@@ -144,44 +140,108 @@ async function findCard(db: DB, cardId: string) {
   return row;
 }
 
+// ---- writes --------------------------------------------------------------
+
+/** Who is making a change, and (for client changes) the change's id. */
+export interface Actor {
+  userId: string;
+  /** Set for client board changes; repeats are applied at most once. */
+  opId?: string | undefined;
+}
+
+/** The outcome of a board write. */
+export type BoardWrite<T> = {
+  boardId: string;
+  revision: number;
+  /** The change as everyone sees it (also kept in the change log). */
+  event: BoardChangeEvent;
+} & (
+  | { replayed: false; value: T }
+  /** This opId was already applied: nothing changed, here's what it did then. */
+  | { replayed: true; value?: undefined }
+);
+
+/** A previously applied op, with the event it produced. */
+async function findApplied(db: DB, actor: Actor): Promise<BoardWrite<never> | null> {
+  if (!actor.opId) return null;
+  const row = await db
+    .selectFrom("applied_ops")
+    .innerJoin("board_changes", (join) =>
+      join
+        .onRef("board_changes.board_id", "=", "applied_ops.board_id")
+        .onRef("board_changes.revision", "=", "applied_ops.revision"),
+    )
+    .select([
+      "applied_ops.user_id",
+      "applied_ops.board_id",
+      "applied_ops.revision",
+      "board_changes.event",
+    ])
+    .where("applied_ops.op_id", "=", actor.opId)
+    .executeTakeFirst();
+  if (!row) return null;
+  if (row.user_id !== actor.userId) {
+    throw new StoreError("conflict", "that change id belongs to someone else");
+  }
+  return { boardId: row.board_id, revision: row.revision, event: row.event, replayed: true };
+}
+
 /**
- * Runs `change` as a write to one board: checks membership, locks the board,
- * and bumps its revision in the same transaction.
+ * Runs `change` as a write to one board, in one transaction: checks
+ * membership, locks the board, applies the change, bumps the revision, logs
+ * the resulting event, and records the op as applied.
+ *
+ * `target` is the board id, or a function that finds it (e.g. from a card).
+ * Replays are detected before resolving it, so resending "delete card" still
+ * answers with the original result rather than "card not found".
  */
 async function writeBoard<T>(
   db: DB,
-  userId: string,
-  boardId: string,
+  actor: Actor,
+  target: string | (() => Promise<string>),
   opts: { owner?: boolean },
-  change: (trx: DB, board: BoardSummary) => Promise<T>,
-): Promise<Revisioned<T>> {
+  change: (trx: DB, board: BoardSummary, boardId: string) => Promise<T>,
+  toEvent: (value: T, revision: number, boardId: string) => BoardChangeEvent,
+): Promise<BoardWrite<T>> {
+  const earlier = await findApplied(db, actor);
+  if (earlier) return earlier;
+  const boardId = typeof target === "string" ? target : await target();
+
   return db.transaction().execute(async (trx) => {
-    const { revision: _before, ...board } = await requireMember(trx, userId, boardId, {
+    const { revision: _before, ...board } = await requireMember(trx, actor.userId, boardId, {
       ...opts,
       lock: true,
     });
-    const value = await change(trx, board);
+    // The same op sent twice at once: the second waits on the lock above.
+    const raced = await findApplied(trx, actor);
+    if (raced) return raced;
+
+    const value = await change(trx, board, boardId);
     const { revision } = await trx
       .updateTable("boards")
       .set({ revision: sql<number>`revision + 1`, updated_at: new Date() })
       .where("id", "=", boardId)
       .returning("revision")
       .executeTakeFirstOrThrow();
-    return { value, boardId, revision };
+    const event = toEvent(value, revision, boardId);
+    await trx
+      .insertInto("board_changes")
+      .values({ board_id: boardId, revision, event: JSON.stringify(event) })
+      .execute();
+    if (actor.opId) {
+      await trx
+        .insertInto("applied_ops")
+        .values({ op_id: actor.opId, user_id: actor.userId, board_id: boardId, revision })
+        .execute();
+    }
+    return { boardId, revision, event, replayed: false, value };
   });
 }
 
-/**
- * The board a column or card belongs to. Read before taking the board lock;
- * the write re-reads the row under the lock in case it changed meanwhile.
- */
-async function boardOfColumn(db: DB, columnId: string): Promise<string> {
-  return (await findColumn(db, columnId)).board_id;
-}
+const boardOfColumn = (db: DB, columnId: string) => async () =>
+  (await findColumn(db, columnId)).board_id;
 
-async function boardOfCard(db: DB, cardId: string): Promise<string> {
-  return (await findCard(db, cardId)).board_id;
-}
+const boardOfCard = (db: DB, cardId: string) => async () => (await findCard(db, cardId)).board_id;
 
 // ---- boards --------------------------------------------------------------
 
@@ -212,7 +272,7 @@ export async function createBoard(
   db: DB,
   userId: string,
   name: string,
-): Promise<Revisioned<BoardSummary>> {
+): Promise<{ board: BoardSummary; revision: number }> {
   return db.transaction().execute(async (trx) => {
     const board = await trx
       .insertInto("boards")
@@ -235,8 +295,7 @@ export async function createBoard(
       )
       .execute();
     return {
-      value: { id: board.id, name: board.name, role: "owner" as const },
-      boardId: board.id,
+      board: { id: board.id, name: board.name, role: "owner" as const },
       revision: board.revision,
     };
   });
@@ -246,17 +305,31 @@ export async function createBoard(
  * Renames the board. Also returns its members and their roles, read in the
  * same transaction, so the caller can tell each of them (with their own role)
  * without a second query that could fail after the rename committed.
+ *
+ * The logged event carries the owner's role; clients ignore `role` when
+ * applying a rename to a board they have open.
  */
 export async function renameBoard(
   db: DB,
-  userId: string,
+  actor: Actor,
   boardId: string,
   name: string,
-): Promise<Revisioned<{ name: string; members: { userId: string; role: BoardRole }[] }>> {
-  return writeBoard(db, userId, boardId, { owner: true }, async (trx) => {
-    await trx.updateTable("boards").set({ name }).where("id", "=", boardId).execute();
-    return { name, members: await listMemberRoles(trx, boardId) };
-  });
+): Promise<BoardWrite<{ members: { userId: string; role: BoardRole }[] }>> {
+  return writeBoard(
+    db,
+    actor,
+    boardId,
+    { owner: true },
+    async (trx) => {
+      await trx.updateTable("boards").set({ name }).where("id", "=", boardId).execute();
+      return { members: await listMemberRoles(trx, boardId) };
+    },
+    (_value, revision) => ({
+      type: "board_upserted",
+      board: { id: boardId, name, role: "owner" },
+      revision,
+    }),
+  );
 }
 
 /** Deletes the board and returns who was on it, so they can be told. */
@@ -326,264 +399,385 @@ export async function getBoardSnapshot(
     });
 }
 
-export async function addMember(
+/** Catching up a client further behind than this sends a snapshot instead. */
+export const MAX_CATCH_UP = 500;
+
+/**
+ * Every change to a board after `sinceRevision`, in order, or null if the
+ * log can't provide all of them (pruned, too many, or a client claiming a
+ * revision the board never reached). Null means: send a snapshot.
+ */
+export async function getChangesSince(
   db: DB,
   userId: string,
   boardId: string,
+  sinceRevision: number,
+): Promise<BoardChangeEvent[] | null> {
+  return db
+    .transaction()
+    .setIsolationLevel("repeatable read")
+    .execute(async (trx) => {
+      const { revision } = await requireMember(trx, userId, boardId);
+      const missing = revision - sinceRevision;
+      if (missing < 0 || missing > MAX_CATCH_UP) return null;
+      if (missing === 0) return [];
+      const rows = await trx
+        .selectFrom("board_changes")
+        .select(["revision", "event"])
+        .where("board_id", "=", boardId)
+        .where("revision", ">", sinceRevision)
+        .where("revision", "<=", revision)
+        .orderBy("revision")
+        .execute();
+      // Revisions are gap-free, so a complete answer has exactly one row each.
+      if (rows.length !== missing || rows[0]?.revision !== sinceRevision + 1) return null;
+      return rows.map((r) => r.event);
+    });
+}
+
+/** Forgets change-log and applied-op entries older than `before`. */
+export async function pruneHistory(db: DB, before: Date): Promise<void> {
+  await db.deleteFrom("applied_ops").where("created_at", "<", before).execute();
+  await db.deleteFrom("board_changes").where("created_at", "<", before).execute();
+}
+
+export async function addMember(
+  db: DB,
+  actor: Actor,
+  boardId: string,
   email: string,
-): Promise<Revisioned<{ member: BoardMember; boardName: string }>> {
-  return writeBoard(db, userId, boardId, { owner: true }, async (trx, board) => {
-    const user = await trx
-      .selectFrom("users")
-      .select(["id", "email", "display_name"])
-      .where("email", "=", email.trim().toLowerCase())
-      .executeTakeFirst();
-    if (!user) throw new StoreError("not_found", "no account uses that email");
-    const inserted = await trx
-      .insertInto("board_members")
-      .values({ board_id: boardId, user_id: user.id, role: "editor" })
-      .onConflict((oc) => oc.columns(["board_id", "user_id"]).doNothing())
-      .executeTakeFirst();
-    if (inserted.numInsertedOrUpdatedRows === 0n) {
-      throw new StoreError("conflict", "that person is already on this board");
-    }
-    const member: BoardMember = {
-      userId: user.id,
-      email: user.email,
-      displayName: user.display_name,
-      role: "editor",
-    };
-    return { member, boardName: board.name };
-  });
+): Promise<BoardWrite<{ member: BoardMember; boardName: string }>> {
+  return writeBoard(
+    db,
+    actor,
+    boardId,
+    { owner: true },
+    async (trx, board) => {
+      const user = await trx
+        .selectFrom("users")
+        .select(["id", "email", "display_name"])
+        .where("email", "=", email.trim().toLowerCase())
+        .executeTakeFirst();
+      if (!user) throw new StoreError("not_found", "no account uses that email");
+      const inserted = await trx
+        .insertInto("board_members")
+        .values({ board_id: boardId, user_id: user.id, role: "editor" })
+        .onConflict((oc) => oc.columns(["board_id", "user_id"]).doNothing())
+        .executeTakeFirst();
+      if (inserted.numInsertedOrUpdatedRows === 0n) {
+        throw new StoreError("conflict", "that person is already on this board");
+      }
+      const member: BoardMember = {
+        userId: user.id,
+        email: user.email,
+        displayName: user.display_name,
+        role: "editor",
+      };
+      return { member, boardName: board.name };
+    },
+    ({ member }, revision) => ({ type: "member_added", boardId, member, revision }),
+  );
 }
 
 // ---- columns -------------------------------------------------------------
 
+const columnUpserted = (column: Column, revision: number): BoardChangeEvent => ({
+  type: "column_upserted",
+  column,
+  revision,
+});
+
 export async function createColumn(
   db: DB,
-  userId: string,
+  actor: Actor,
   boardId: string,
   name: string,
   id?: string,
-): Promise<Revisioned<Column>> {
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const siblings = await trx
-      .selectFrom("board_columns")
-      .select(["id", "position"])
-      .where("board_id", "=", boardId)
-      .orderBy("position")
-      .execute();
-    const row = await trx
-      .insertInto("board_columns")
-      .values({ ...(id ? { id } : {}), board_id: boardId, name, position: positionAtEnd(siblings) })
-      .onConflict((oc) => oc.column("id").doNothing())
-      .returning(COLUMN_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("conflict", "that id is already in use");
-    return toColumn(row);
-  });
+): Promise<BoardWrite<Column>> {
+  return writeBoard(
+    db,
+    actor,
+    boardId,
+    {},
+    async (trx) => {
+      const siblings = await trx
+        .selectFrom("board_columns")
+        .select(["id", "position"])
+        .where("board_id", "=", boardId)
+        .orderBy("position")
+        .execute();
+      const row = await trx
+        .insertInto("board_columns")
+        .values({
+          ...(id ? { id } : {}),
+          board_id: boardId,
+          name,
+          position: positionAtEnd(siblings),
+        })
+        .onConflict((oc) => oc.column("id").doNothing())
+        .returning(COLUMN_FIELDS)
+        .executeTakeFirst();
+      if (!row) throw new StoreError("conflict", "that id is already in use");
+      return toColumn(row);
+    },
+    columnUpserted,
+  );
 }
 
 export async function renameColumn(
   db: DB,
-  userId: string,
+  actor: Actor,
   columnId: string,
   name: string,
-): Promise<Revisioned<Column>> {
-  const boardId = await boardOfColumn(db, columnId);
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const row = await trx
-      .updateTable("board_columns")
-      .set({ name })
-      .where("id", "=", columnId)
-      .returning(COLUMN_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("not_found", "column not found");
-    return toColumn(row);
-  });
+): Promise<BoardWrite<Column>> {
+  return writeBoard(
+    db,
+    actor,
+    boardOfColumn(db, columnId),
+    {},
+    async (trx) => {
+      const row = await trx
+        .updateTable("board_columns")
+        .set({ name })
+        .where("id", "=", columnId)
+        .returning(COLUMN_FIELDS)
+        .executeTakeFirst();
+      if (!row) throw new StoreError("not_found", "column not found");
+      return toColumn(row);
+    },
+    columnUpserted,
+  );
 }
 
 export async function moveColumn(
   db: DB,
-  userId: string,
+  actor: Actor,
   columnId: string,
   afterId: string | null,
   beforeId: string | null,
-): Promise<Revisioned<Column>> {
-  const boardId = await boardOfColumn(db, columnId);
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const siblings = await trx
-      .selectFrom("board_columns")
-      .select(["id", "position"])
-      .where("board_id", "=", boardId)
-      .where("id", "!=", columnId)
-      .orderBy("position")
-      .execute();
-    const row = await trx
-      .updateTable("board_columns")
-      .set({ position: positionBetweenNeighbours(siblings, afterId, beforeId) })
-      .where("id", "=", columnId)
-      .returning(COLUMN_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("not_found", "column not found");
-    return toColumn(row);
-  });
+): Promise<BoardWrite<Column>> {
+  return writeBoard(
+    db,
+    actor,
+    boardOfColumn(db, columnId),
+    {},
+    async (trx, _board, boardId) => {
+      const siblings = await trx
+        .selectFrom("board_columns")
+        .select(["id", "position"])
+        .where("board_id", "=", boardId)
+        .where("id", "!=", columnId)
+        .orderBy("position")
+        .execute();
+      const row = await trx
+        .updateTable("board_columns")
+        .set({ position: positionBetweenNeighbours(siblings, afterId, beforeId) })
+        .where("id", "=", columnId)
+        .returning(COLUMN_FIELDS)
+        .executeTakeFirst();
+      if (!row) throw new StoreError("not_found", "column not found");
+      return toColumn(row);
+    },
+    columnUpserted,
+  );
 }
 
 export async function deleteColumn(
   db: DB,
-  userId: string,
+  actor: Actor,
   columnId: string,
-): Promise<Revisioned<Column>> {
-  const boardId = await boardOfColumn(db, columnId);
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const row = await trx
-      .deleteFrom("board_columns")
-      .where("id", "=", columnId)
-      .returning(COLUMN_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("not_found", "column not found");
-    return toColumn(row);
-  });
+): Promise<BoardWrite<Column>> {
+  return writeBoard(
+    db,
+    actor,
+    boardOfColumn(db, columnId),
+    {},
+    async (trx) => {
+      const row = await trx
+        .deleteFrom("board_columns")
+        .where("id", "=", columnId)
+        .returning(COLUMN_FIELDS)
+        .executeTakeFirst();
+      if (!row) throw new StoreError("not_found", "column not found");
+      return toColumn(row);
+    },
+    (column, revision, boardId) => ({
+      type: "column_deleted",
+      boardId,
+      columnId: column.id,
+      revision,
+    }),
+  );
 }
 
 // ---- cards ---------------------------------------------------------------
 
+const cardUpserted = (card: Card, revision: number): BoardChangeEvent => ({
+  type: "card_upserted",
+  card,
+  revision,
+});
+
 export async function createCard(
   db: DB,
-  userId: string,
+  actor: Actor,
   columnId: string,
   title: string,
   id?: string,
-): Promise<Revisioned<Card>> {
-  const boardId = await boardOfColumn(db, columnId);
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    await findColumn(trx, columnId); // still there?
-    const siblings = await trx
-      .selectFrom("cards")
-      .select(["id", "position"])
-      .where("column_id", "=", columnId)
-      .orderBy("position")
-      .execute();
-    const row = await trx
-      .insertInto("cards")
-      .values({
-        ...(id ? { id } : {}),
-        board_id: boardId,
-        column_id: columnId,
-        title,
-        position: positionAtEnd(siblings),
-      })
-      .onConflict((oc) => oc.column("id").doNothing())
-      .returning(CARD_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("conflict", "that id is already in use");
-    return toCard(row);
-  });
+): Promise<BoardWrite<Card>> {
+  return writeBoard(
+    db,
+    actor,
+    boardOfColumn(db, columnId),
+    {},
+    async (trx, _board, boardId) => {
+      await findColumn(trx, columnId); // still there?
+      const siblings = await trx
+        .selectFrom("cards")
+        .select(["id", "position"])
+        .where("column_id", "=", columnId)
+        .orderBy("position")
+        .execute();
+      const row = await trx
+        .insertInto("cards")
+        .values({
+          ...(id ? { id } : {}),
+          board_id: boardId,
+          column_id: columnId,
+          title,
+          position: positionAtEnd(siblings),
+        })
+        .onConflict((oc) => oc.column("id").doNothing())
+        .returning(CARD_FIELDS)
+        .executeTakeFirst();
+      if (!row) throw new StoreError("conflict", "that id is already in use");
+      return toCard(row);
+    },
+    cardUpserted,
+  );
 }
 
 export type CardEdit = Partial<Record<CardField, { value: string; baseVersion: number }>>;
 
 export async function updateCard(
   db: DB,
-  userId: string,
+  actor: Actor,
   cardId: string,
   edit: CardEdit,
-): Promise<Revisioned<Card>> {
-  const boardId = await boardOfCard(db, cardId);
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    // The board lock taken by writeBoard keeps this row stable until commit.
-    const current = await trx
-      .selectFrom("cards")
-      .select([...CARD_FIELDS, "title_version", "description_version"])
-      .where("id", "=", cardId)
-      .executeTakeFirst();
-    if (!current) throw new StoreError("not_found", "card not found");
-    const fieldVersion = { title: current.title_version, description: current.description_version };
+): Promise<BoardWrite<Card>> {
+  return writeBoard(
+    db,
+    actor,
+    boardOfCard(db, cardId),
+    {},
+    async (trx) => {
+      // The board lock taken by writeBoard keeps this row stable until commit.
+      const current = await trx
+        .selectFrom("cards")
+        .select([...CARD_FIELDS, "title_version", "description_version"])
+        .where("id", "=", cardId)
+        .executeTakeFirst();
+      if (!current) throw new StoreError("not_found", "card not found");
+      const fieldVersion = {
+        title: current.title_version,
+        description: current.description_version,
+      };
 
-    const changed: CardField[] = [];
-    const conflicts: CardField[] = [];
-    for (const field of ["title", "description"] as const) {
-      const change = edit[field];
-      if (!change || change.value === current[field]) continue; // nothing to do
-      if (fieldVersion[field] > change.baseVersion) conflicts.push(field);
-      else changed.push(field);
-    }
-    if (conflicts.length > 0) {
-      throw new StoreError(
-        "conflict",
-        "someone else changed this card while you were editing",
-        conflicts,
-      );
-    }
-    if (changed.length === 0) return toCard(current);
+      const changed: CardField[] = [];
+      const conflicts: CardField[] = [];
+      for (const field of ["title", "description"] as const) {
+        const change = edit[field];
+        if (!change || change.value === current[field]) continue; // nothing to do
+        if (fieldVersion[field] > change.baseVersion) conflicts.push(field);
+        else changed.push(field);
+      }
+      if (conflicts.length > 0) {
+        throw new StoreError(
+          "conflict",
+          "someone else changed this card while you were editing",
+          conflicts,
+        );
+      }
+      if (changed.length === 0) return toCard(current);
 
-    const version = current.version + 1;
-    const row = await trx
-      .updateTable("cards")
-      .set({
-        version,
-        updated_at: new Date(),
-        ...(changed.includes("title") ? { title: edit.title!.value, title_version: version } : {}),
-        ...(changed.includes("description")
-          ? { description: edit.description!.value, description_version: version }
-          : {}),
-      })
-      .where("id", "=", cardId)
-      .returning(CARD_FIELDS)
-      .executeTakeFirstOrThrow();
-    return toCard(row);
-  });
+      const version = current.version + 1;
+      const row = await trx
+        .updateTable("cards")
+        .set({
+          version,
+          updated_at: new Date(),
+          ...(changed.includes("title")
+            ? { title: edit.title!.value, title_version: version }
+            : {}),
+          ...(changed.includes("description")
+            ? { description: edit.description!.value, description_version: version }
+            : {}),
+        })
+        .where("id", "=", cardId)
+        .returning(CARD_FIELDS)
+        .executeTakeFirstOrThrow();
+      return toCard(row);
+    },
+    cardUpserted,
+  );
 }
 
 export async function moveCard(
   db: DB,
-  userId: string,
+  actor: Actor,
   cardId: string,
   toColumnId: string,
   afterId: string | null,
   beforeId: string | null,
-): Promise<Revisioned<Card>> {
-  const boardId = await boardOfCard(db, cardId);
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const target = await findColumn(trx, toColumnId);
-    if (target.board_id !== boardId) throw new StoreError("not_found", "column not found");
-    const siblings = await trx
-      .selectFrom("cards")
-      .select(["id", "position"])
-      .where("column_id", "=", toColumnId)
-      .where("id", "!=", cardId)
-      .orderBy("position")
-      .execute();
-    const row = await trx
-      .updateTable("cards")
-      .set({
-        column_id: toColumnId,
-        position: positionBetweenNeighbours(siblings, afterId, beforeId),
-        version: sql<number>`version + 1`,
-        updated_at: new Date(),
-      })
-      .where("id", "=", cardId)
-      .returning(CARD_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("not_found", "card not found"); // deleted meanwhile
-    return toCard(row);
-  });
+): Promise<BoardWrite<Card>> {
+  return writeBoard(
+    db,
+    actor,
+    boardOfCard(db, cardId),
+    {},
+    async (trx, _board, boardId) => {
+      const target = await findColumn(trx, toColumnId);
+      if (target.board_id !== boardId) throw new StoreError("not_found", "column not found");
+      const siblings = await trx
+        .selectFrom("cards")
+        .select(["id", "position"])
+        .where("column_id", "=", toColumnId)
+        .where("id", "!=", cardId)
+        .orderBy("position")
+        .execute();
+      const row = await trx
+        .updateTable("cards")
+        .set({
+          column_id: toColumnId,
+          position: positionBetweenNeighbours(siblings, afterId, beforeId),
+          version: sql<number>`version + 1`,
+          updated_at: new Date(),
+        })
+        .where("id", "=", cardId)
+        .returning(CARD_FIELDS)
+        .executeTakeFirst();
+      if (!row) throw new StoreError("not_found", "card not found"); // deleted meanwhile
+      return toCard(row);
+    },
+    cardUpserted,
+  );
 }
 
-export async function deleteCard(
-  db: DB,
-  userId: string,
-  cardId: string,
-): Promise<Revisioned<Card>> {
-  const boardId = await boardOfCard(db, cardId);
-  return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const row = await trx
-      .deleteFrom("cards")
-      .where("id", "=", cardId)
-      .returning(CARD_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("not_found", "card not found");
-    return toCard(row);
-  });
+export async function deleteCard(db: DB, actor: Actor, cardId: string): Promise<BoardWrite<Card>> {
+  return writeBoard(
+    db,
+    actor,
+    boardOfCard(db, cardId),
+    {},
+    async (trx) => {
+      const row = await trx
+        .deleteFrom("cards")
+        .where("id", "=", cardId)
+        .returning(CARD_FIELDS)
+        .executeTakeFirst();
+      if (!row) throw new StoreError("not_found", "card not found");
+      return toCard(row);
+    },
+    (card, revision, boardId) => ({ type: "card_deleted", boardId, cardId: card.id, revision }),
+  );
 }

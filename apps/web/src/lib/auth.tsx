@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { LoginRequest, SignupRequest, User } from "@collab/shared";
 import * as api from "./api";
+import { clearUser } from "./offline-store";
 
 export type AuthState =
   | { status: "loading" }
@@ -51,6 +52,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       },
       logout: async () => {
         await api.logout();
+        // Saved boards and unsent changes belong to this user; don't leave
+        // them behind on a shared computer.
+        if (state.status === "authenticated") clearUser(state.user.id);
         setState({ status: "anonymous" });
       },
     }),

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { sql } from "kysely";
 import { afterAll, beforeAll, beforeEach } from "vitest";
@@ -32,7 +33,9 @@ export function useTestDb(): () => DB {
     await db?.destroy();
   });
   beforeEach(async () => {
-    await sql`TRUNCATE users, sessions, boards, board_members, board_columns, cards`.execute(db!);
+    await sql`TRUNCATE users, sessions, boards, board_members, board_columns, cards, board_changes, applied_ops`.execute(
+      db!,
+    );
   });
   return () => db!;
 }
@@ -88,12 +91,20 @@ export function cookieFrom(res: Response): string {
   return header.split(";")[0]!;
 }
 
+/** A request body whose `opId` (if it takes one) is optional. */
+export type TestRequest = ClientRequestBody extends infer R
+  ? R extends { opId: string }
+    ? Omit<R, "opId"> & { opId?: string }
+    : R
+  : never;
+
 export interface TestClient {
   ws: WebSocket;
   /** The next message, in arrival order. */
   next: () => Promise<ServerMessage>;
   /** Sends a request and resolves with its events once acked; rejects on error. */
-  request: (body: ClientRequestBody) => Promise<ServerEvent[]>;
+  /** Board changes get a fresh `opId` unless the test sets one. */
+  request: (body: TestRequest) => Promise<ServerEvent[]>;
   /**
    * Everything queued for this client right now: pings the server and
    * collects messages until the pong. A socket's messages arrive in send
@@ -162,11 +173,12 @@ export async function connectClient(
     });
 
   let counter = 0;
-  const request = (body: ClientRequestBody) =>
+  const request = (body: TestRequest) =>
     new Promise<ServerEvent[]>((resolve, reject) => {
       const requestId = `r${++counter}`;
       pending.set(requestId, { events: [], resolve, reject });
-      ws.send(JSON.stringify({ ...body, requestId }));
+      // The server ignores opId on requests that don't take one.
+      ws.send(JSON.stringify({ opId: randomUUID(), ...body, requestId }));
     });
 
   let pingCounter = 0;

@@ -3,6 +3,7 @@ import type { DB } from "./schema.ts";
 import * as m0001 from "./migrations/0001_initial.ts";
 import * as m0002 from "./migrations/0002_board_revision.ts";
 import * as m0003 from "./migrations/0003_card_versions.ts";
+import * as m0004 from "./migrations/0004_change_log.ts";
 
 /**
  * Migrations are registered explicitly rather than read from disk, so they
@@ -12,6 +13,7 @@ const migrations: Record<string, Migration> = {
   "0001_initial": m0001,
   "0002_board_revision": m0002,
   "0003_card_versions": m0003,
+  "0004_change_log": m0004,
 };
 
 const provider: MigrationProvider = { getMigrations: async () => migrations };

@@ -9,8 +9,10 @@ import {
   moveCardInLayout,
   moveColumnInLayout,
   syncReducer,
+  unsentOps,
   viewOf,
   type BoardAction,
+  type BoardOp,
   type BoardSync,
 } from "./board-state.ts";
 
@@ -164,17 +166,16 @@ describe("syncReducer: ordering", () => {
 describe("optimistic updates", () => {
   const act = (actions: BoardAction[], from: BoardSync) =>
     actions.reduce((sync, action) => boardReducer(sync, action, BOARD), from);
-  const columnOrder = (sync: BoardSync) => layoutOf(viewOf(sync)!).cardsByColumn;
+  const cardsIn = (sync: BoardSync) => layoutOf(viewOf(sync)!).cardsByColumn;
+  const start = (op: BoardOp, deferred = false): BoardAction => ({
+    kind: "op_started",
+    op,
+    deferred,
+  });
 
   it("shows our change immediately, before the server answers", () => {
     const sync = act(
-      [
-        {
-          kind: "op_started",
-          key: 1,
-          op: { type: "create_card", columnId: "done", title: "new", id: "n1" },
-        },
-      ],
+      [start({ type: "create_card", columnId: "done", title: "new", id: "n1", opId: "o1" })],
       loaded(),
     );
     expect(viewOf(sync)?.cards.n1).toMatchObject({ title: "new", columnId: "done" });
@@ -183,10 +184,7 @@ describe("optimistic updates", () => {
 
   it("rolls back when the server rejects it", () => {
     const sync = act(
-      [
-        { kind: "op_started", key: 1, op: { type: "delete_card", cardId: "c1" } },
-        { kind: "op_failed", key: 1 },
-      ],
+      [start({ type: "delete_card", cardId: "c1", opId: "o1" }), { kind: "op_failed", opId: "o1" }],
       loaded(),
     );
     expect(viewOf(sync)?.cards.c1).toBeDefined();
@@ -200,14 +198,15 @@ describe("optimistic updates", () => {
       toColumnId: "done",
       afterId: null,
       beforeId: null,
+      opId: "o1",
     } as const;
-    let sync = act([{ kind: "op_started", key: 1, op }], loaded());
+    let sync = act([start(op)], loaded());
     // The ack can arrive while the server's event for revision 11 is still held
     // back behind a gap: the op must stay until revision 11 is applied.
     sync = act(
       [
         { kind: "event", event: upsert(12, card("x", "doing", "a5")) },
-        { kind: "op_confirmed", key: 1, revision: 11 },
+        { kind: "op_confirmed", opId: "o1", revision: 11 },
       ],
       sync,
     );
@@ -226,45 +225,41 @@ describe("optimistic updates", () => {
     // We drop c3 directly after c1 in "todo"; meanwhile someone adds c9 there.
     let sync = act(
       [
-        {
-          kind: "op_started",
-          key: 1,
-          op: {
-            type: "move_card",
-            cardId: "c3",
-            toColumnId: "todo",
-            afterId: "c1",
-            beforeId: "c2",
-          },
-        },
+        start({
+          type: "move_card",
+          cardId: "c3",
+          toColumnId: "todo",
+          afterId: "c1",
+          beforeId: "c2",
+          opId: "o1",
+        }),
       ],
       loaded(),
     );
-    expect(columnOrder(sync).todo).toEqual(["c1", "c3", "c2"]);
+    expect(cardsIn(sync).todo).toEqual(["c1", "c3", "c2"]);
     sync = act([{ kind: "event", event: upsert(11, card("c9", "todo", "a0V")) }], sync);
     // c9 sits between c1 and c2 now; our card still goes right after c1.
-    expect(columnOrder(sync).todo).toEqual(["c1", "c3", "c9", "c2"]);
+    expect(cardsIn(sync).todo).toEqual(["c1", "c3", "c9", "c2"]);
   });
 
   it("predicts edits and column changes", () => {
     const sync = act(
       [
-        {
-          kind: "op_started",
-          key: 1,
-          op: { type: "update_card", cardId: "c1", title: { value: "renamed", baseVersion: 0 } },
-        },
-        {
-          kind: "op_started",
-          key: 2,
-          op: { type: "create_column", boardId: BOARD, name: "Later", id: "later" },
-        },
-        {
-          kind: "op_started",
-          key: 3,
-          op: { type: "move_column", columnId: "later", afterId: null, beforeId: "todo" },
-        },
-        { kind: "op_started", key: 4, op: { type: "delete_column", columnId: "doing" } },
+        start({
+          type: "update_card",
+          cardId: "c1",
+          title: { value: "renamed", baseVersion: 0 },
+          opId: "o1",
+        }),
+        start({ type: "create_column", boardId: BOARD, name: "Later", id: "later", opId: "o2" }),
+        start({
+          type: "move_column",
+          columnId: "later",
+          afterId: null,
+          beforeId: "todo",
+          opId: "o3",
+        }),
+        start({ type: "delete_column", columnId: "doing", opId: "o4" }),
       ],
       loaded(),
     );
@@ -281,15 +276,113 @@ describe("optimistic updates", () => {
           kind: "event",
           event: { type: "card_deleted", boardId: BOARD, cardId: "c1", revision: 11 },
         },
-        {
-          kind: "op_started",
-          key: 1,
-          op: { type: "update_card", cardId: "c1", title: { value: "x", baseVersion: 0 } },
-        },
+        start({
+          type: "update_card",
+          cardId: "c1",
+          title: { value: "x", baseVersion: 0 },
+          opId: "o1",
+        }),
       ],
       loaded(),
     );
     expect(viewOf(sync)?.cards.c1).toBeUndefined();
+  });
+});
+
+describe("offline changes", () => {
+  const act = (actions: BoardAction[], from: BoardSync) =>
+    actions.reduce((sync, action) => boardReducer(sync, action, BOARD), from);
+  const del = (opId: string, cardId = "c1"): BoardOp => ({ type: "delete_card", cardId, opId });
+  const conflict = {
+    code: "conflict",
+    message: "someone else changed this card",
+    conflictingFields: ["title" as const],
+  };
+
+  it("keeps changes made offline and counts them as unsent", () => {
+    const sync = act([{ kind: "op_started", op: del("o1"), deferred: true }], loaded());
+    expect(viewOf(sync)?.cards.c1).toBeUndefined();
+    expect(unsentOps(sync)).toHaveLength(1);
+    expect(sync.ops[0]?.deferred).toBe(true);
+  });
+
+  it("marks a change deferred when its connection drops before the answer", () => {
+    const sync = act(
+      [
+        { kind: "op_started", op: del("o1"), deferred: false },
+        { kind: "op_deferred", opId: "o1" },
+      ],
+      loaded(),
+    );
+    expect(sync.ops[0]?.deferred).toBe(true);
+  });
+
+  it("moves a refused offline change to the review list and rolls it back", () => {
+    const sync = act(
+      [
+        { kind: "op_started", op: del("o1"), deferred: true },
+        { kind: "op_rejected", opId: "o1", error: conflict },
+      ],
+      loaded(),
+    );
+    expect(viewOf(sync)?.cards.c1).toBeDefined();
+    expect(sync.ops).toEqual([]);
+    expect(sync.rejected).toEqual([{ op: del("o1"), ...conflict }]);
+  });
+
+  it("drops a reviewed change when dismissed", () => {
+    const sync = act(
+      [
+        { kind: "op_started", op: del("o1"), deferred: true },
+        { kind: "op_rejected", opId: "o1", error: conflict },
+        { kind: "rejected_dismissed", opId: "o1" },
+      ],
+      loaded(),
+    );
+    expect(sync.rejected).toEqual([]);
+  });
+
+  it("restores saved state when nothing newer has arrived", () => {
+    const saved = loaded();
+    const sync = act(
+      [
+        {
+          kind: "restored",
+          data: saved.data,
+          ops: [{ op: del("o1") }],
+          rejected: [{ op: del("o2", "c2"), ...conflict }],
+        },
+      ],
+      initialSync,
+    );
+    expect(sync.data?.revision).toBe(10);
+    expect(viewOf(sync)?.cards.c1).toBeUndefined();
+    expect(sync.ops[0]?.deferred).toBe(true); // made in an earlier visit
+    expect(sync.rejected).toHaveLength(1);
+  });
+
+  it("never lets saved state overwrite newer data, and doesn't duplicate changes", () => {
+    let sync = act(
+      [
+        { kind: "event", event: upsert(11, card("c4", "done", "a0")) },
+        { kind: "op_started", op: del("o1"), deferred: true },
+      ],
+      loaded(),
+    );
+    const stale = loaded().data; // revision 10
+    sync = act(
+      [
+        {
+          kind: "restored",
+          data: stale,
+          ops: [{ op: del("o1") }, { op: del("o0", "c2") }],
+          rejected: [],
+        },
+      ],
+      sync,
+    );
+    expect(sync.data?.revision).toBe(11);
+    expect(sync.ops.map((o) => o.op.opId)).toEqual(["o0", "o1"]); // saved (older) first
   });
 });
 

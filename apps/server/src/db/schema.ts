@@ -1,4 +1,5 @@
 import type { ColumnType, Generated, Kysely } from "kysely";
+import type { BoardChangeEvent } from "@collab/shared";
 
 /** Kysely table types. Keep in sync with the migrations in ./migrations. */
 
@@ -65,6 +66,23 @@ export interface CardsTable {
   updated_at: Timestamp;
 }
 
+export interface BoardChangesTable {
+  board_id: string;
+  revision: number;
+  /** The event as broadcast, minus any requestId. Inserted as JSON text. */
+  event: ColumnType<BoardChangeEvent, string, never>;
+  created_at: CreatedAt;
+}
+
+export interface AppliedOpsTable {
+  op_id: string;
+  user_id: string;
+  board_id: string;
+  /** The board revision the op produced. Its event is in board_changes. */
+  revision: number;
+  created_at: CreatedAt;
+}
+
 export interface Database {
   users: UsersTable;
   sessions: SessionsTable;
@@ -72,6 +90,8 @@ export interface Database {
   board_members: BoardMembersTable;
   board_columns: BoardColumnsTable;
   cards: CardsTable;
+  board_changes: BoardChangesTable;
+  applied_ops: AppliedOpsTable;
 }
 
 export type DB = Kysely<Database>;
