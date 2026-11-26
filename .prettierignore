@@ -1,0 +1,6 @@
+pnpm-lock.yaml
+.next
+dist
+coverage
+node_modules
+apps/web/AGENTS.md

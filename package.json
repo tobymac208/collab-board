@@ -1,0 +1,25 @@
+{
+  "name": "collab-board",
+  "private": true,
+  "description": "Real-time collaborative kanban board",
+  "license": "MIT",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @collab/web --filter @collab/server dev",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r --if-present lint",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r --if-present test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down"
+  },
+  "devDependencies": {
+    "prettier": "^3",
+    "typescript": "^5"
+  }
+}
