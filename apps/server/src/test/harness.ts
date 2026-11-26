@@ -86,6 +86,12 @@ export interface TestClient {
   next: () => Promise<ServerMessage>;
   /** Sends a request and resolves with its events once acked; rejects on error. */
   request: (body: ClientRequestBody) => Promise<ServerEvent[]>;
+  /**
+   * Everything queued for this client right now: pings the server and
+   * collects messages until the pong. A socket's messages arrive in send
+   * order, so anything broadcast before the ping is included.
+   */
+  drain: () => Promise<ServerMessage[]>;
   close: () => void;
 }
 
@@ -150,7 +156,19 @@ export async function connectClient(
       ws.send(JSON.stringify({ ...body, requestId }));
     });
 
-  return { ws, next, request, close: () => ws.close() };
+  let pingCounter = 0;
+  const drain = async (): Promise<ServerMessage[]> => {
+    const sentAt = -++pingCounter; // negative, so it can't match a real timestamp
+    ws.send(JSON.stringify({ type: "ping", sentAt }));
+    const seen: ServerMessage[] = [];
+    for (;;) {
+      const msg = await next();
+      if (msg.type === "pong" && msg.sentAt === sentAt) return seen;
+      seen.push(msg);
+    }
+  };
+
+  return { ws, next, request, drain, close: () => ws.close() };
 }
 
 /** Connects and consumes the welcome message. */

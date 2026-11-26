@@ -1,16 +1,21 @@
+import { sql } from "kysely";
 import { generateKeyBetween, generateNKeysBetween } from "fractional-indexing";
-import type { BoardMember, BoardSummary, Card, Column } from "@collab/shared";
+import type { BoardMember, BoardRole, BoardSummary, Card, Column } from "@collab/shared";
 import type { DB } from "../db/schema.ts";
 
 /**
  * Board persistence and authorization. Every function takes the acting user
  * and checks their membership before touching data, so callers can't forget.
  *
+ * Writes: every change to a board goes through `writeBoard`, which locks the
+ * board row, applies the change and increments `boards.revision` in one
+ * transaction. The lock queues concurrent writes to the same board one at a
+ * time, so revisions are gap-free and follow commit order, and two writers
+ * can never pick the same position key.
+ *
  * Ordering: columns and cards carry fractional index keys. A move computes a
  * key between the neighbours at the target index, so only the moved row is
- * written. Concurrent moves into the same list are serialised with a row lock
- * on the parent (board for columns, column for cards) so two writers can't
- * pick the same key. Phase 3 revisits ordering under concurrent edits.
+ * written. Phase 3 revisits ordering under concurrent edits.
  */
 
 export class StoreError extends Error {
@@ -20,6 +25,13 @@ export class StoreError extends Error {
   ) {
     super(message);
   }
+}
+
+/** The result of a write, plus the board revision it produced. */
+export interface Revisioned<T> {
+  value: T;
+  boardId: string;
+  revision: number;
 }
 
 const DEFAULT_COLUMNS = ["To do", "In progress", "Done"];
@@ -33,7 +45,7 @@ export function positionAt(sorted: readonly string[], index: number): string {
 // ---- row mappers ---------------------------------------------------------
 
 type ColumnRow = { id: string; board_id: string; name: string; position: string };
-type CardRow = ColumnRow & { column_id: string; title: string; description: string };
+type CardRow = Omit<ColumnRow, "name"> & { column_id: string; title: string; description: string };
 
 const toColumn = (r: ColumnRow): Column => ({
   id: r.id,
@@ -42,7 +54,7 @@ const toColumn = (r: ColumnRow): Column => ({
   position: r.position,
 });
 
-const toCard = (r: Omit<CardRow, "name">): Card => ({
+const toCard = (r: CardRow): Card => ({
   id: r.id,
   boardId: r.board_id,
   columnId: r.column_id,
@@ -66,11 +78,11 @@ async function requireMember(
   userId: string,
   boardId: string,
   opts: { owner?: boolean; lock?: boolean } = {},
-): Promise<BoardSummary> {
+): Promise<BoardSummary & { revision: number }> {
   let query = db
     .selectFrom("boards")
     .innerJoin("board_members", "board_members.board_id", "boards.id")
-    .select(["boards.id", "boards.name", "board_members.role"])
+    .select(["boards.id", "boards.name", "boards.revision", "board_members.role"])
     .where("boards.id", "=", boardId)
     .where("board_members.user_id", "=", userId);
   if (opts.lock) query = query.forUpdate("boards");
@@ -82,10 +94,17 @@ async function requireMember(
   return row;
 }
 
-async function findColumn(db: DB, columnId: string, opts: { lock?: boolean } = {}) {
-  let query = db.selectFrom("board_columns").select(COLUMN_FIELDS).where("id", "=", columnId);
-  if (opts.lock) query = query.forUpdate();
-  const row = await query.executeTakeFirst();
+/** Throws unless `userId` is a member of the board. */
+export async function requireAccess(db: DB, userId: string, boardId: string): Promise<void> {
+  await requireMember(db, userId, boardId);
+}
+
+async function findColumn(db: DB, columnId: string) {
+  const row = await db
+    .selectFrom("board_columns")
+    .select(COLUMN_FIELDS)
+    .where("id", "=", columnId)
+    .executeTakeFirst();
   if (!row) throw new StoreError("not_found", "column not found");
   return row;
 }
@@ -100,17 +119,43 @@ async function findCard(db: DB, cardId: string) {
   return row;
 }
 
-/** Column lookup that also hides columns on boards the user can't see. */
-async function requireColumn(db: DB, userId: string, columnId: string) {
-  const column = await findColumn(db, columnId);
-  await requireMember(db, userId, column.board_id);
-  return column;
+/**
+ * Runs `change` as a write to one board: checks membership, locks the board,
+ * and bumps its revision in the same transaction.
+ */
+async function writeBoard<T>(
+  db: DB,
+  userId: string,
+  boardId: string,
+  opts: { owner?: boolean },
+  change: (trx: DB, board: BoardSummary) => Promise<T>,
+): Promise<Revisioned<T>> {
+  return db.transaction().execute(async (trx) => {
+    const { revision: _before, ...board } = await requireMember(trx, userId, boardId, {
+      ...opts,
+      lock: true,
+    });
+    const value = await change(trx, board);
+    const { revision } = await trx
+      .updateTable("boards")
+      .set({ revision: sql<number>`revision + 1`, updated_at: new Date() })
+      .where("id", "=", boardId)
+      .returning("revision")
+      .executeTakeFirstOrThrow();
+    return { value, boardId, revision };
+  });
 }
 
-async function requireCard(db: DB, userId: string, cardId: string) {
-  const card = await findCard(db, cardId);
-  await requireMember(db, userId, card.board_id);
-  return card;
+/**
+ * The board a column or card belongs to. Read before taking the board lock;
+ * the write re-reads the row under the lock in case it changed meanwhile.
+ */
+async function boardOfColumn(db: DB, columnId: string): Promise<string> {
+  return (await findColumn(db, columnId)).board_id;
+}
+
+async function boardOfCard(db: DB, cardId: string): Promise<string> {
+  return (await findCard(db, cardId)).board_id;
 }
 
 // ---- boards --------------------------------------------------------------
@@ -126,12 +171,28 @@ export async function listBoards(db: DB, userId: string): Promise<BoardSummary[]
     .execute();
 }
 
-export async function createBoard(db: DB, userId: string, name: string): Promise<BoardSummary> {
+/** Every member of a board and their role, for fanning out board-list changes. */
+export async function listMemberRoles(
+  db: DB,
+  boardId: string,
+): Promise<{ userId: string; role: BoardRole }[]> {
+  return db
+    .selectFrom("board_members")
+    .select(["user_id as userId", "role"])
+    .where("board_id", "=", boardId)
+    .execute();
+}
+
+export async function createBoard(
+  db: DB,
+  userId: string,
+  name: string,
+): Promise<Revisioned<BoardSummary>> {
   return db.transaction().execute(async (trx) => {
     const board = await trx
       .insertInto("boards")
       .values({ name, created_by: userId })
-      .returning(["id", "name"])
+      .returning(["id", "name", "revision"])
       .executeTakeFirstOrThrow();
     await trx
       .insertInto("board_members")
@@ -148,32 +209,40 @@ export async function createBoard(db: DB, userId: string, name: string): Promise
         })),
       )
       .execute();
-    return { ...board, role: "owner" as const };
+    return {
+      value: { id: board.id, name: board.name, role: "owner" as const },
+      boardId: board.id,
+      revision: board.revision,
+    };
   });
 }
 
+/** Returns the new name; each member sees it with their own role. */
 export async function renameBoard(
   db: DB,
   userId: string,
   boardId: string,
   name: string,
-): Promise<BoardSummary> {
-  const board = await requireMember(db, userId, boardId, { owner: true });
-  await db
-    .updateTable("boards")
-    .set({ name, updated_at: new Date() })
-    .where("id", "=", boardId)
-    .execute();
-  return { ...board, name };
+): Promise<Revisioned<string>> {
+  return writeBoard(db, userId, boardId, { owner: true }, async (trx) => {
+    await trx.updateTable("boards").set({ name }).where("id", "=", boardId).execute();
+    return name;
+  });
 }
 
-export async function deleteBoard(db: DB, userId: string, boardId: string): Promise<void> {
-  await requireMember(db, userId, boardId, { owner: true });
-  await db.deleteFrom("boards").where("id", "=", boardId).execute();
+/** Deletes the board and returns who was on it, so they can be told. */
+export async function deleteBoard(db: DB, userId: string, boardId: string): Promise<string[]> {
+  return db.transaction().execute(async (trx) => {
+    await requireMember(trx, userId, boardId, { owner: true, lock: true });
+    const members = await listMemberRoles(trx, boardId);
+    await trx.deleteFrom("boards").where("id", "=", boardId).execute();
+    return members.map((m) => m.userId);
+  });
 }
 
 export interface BoardSnapshot {
   board: BoardSummary;
+  revision: number;
   members: BoardMember[];
   columns: Column[];
   cards: Card[];
@@ -184,12 +253,13 @@ export async function getBoardSnapshot(
   userId: string,
   boardId: string,
 ): Promise<BoardSnapshot> {
-  // One transaction so the columns and cards come from the same moment.
+  // One transaction so the board, its revision and its contents all come
+  // from the same moment.
   return db
     .transaction()
     .setIsolationLevel("repeatable read")
     .execute(async (trx) => {
-      const board = await requireMember(trx, userId, boardId);
+      const { revision, ...board } = await requireMember(trx, userId, boardId);
       const [members, columns, cards] = await Promise.all([
         trx
           .selectFrom("board_members")
@@ -217,7 +287,13 @@ export async function getBoardSnapshot(
           .orderBy("position")
           .execute(),
       ]);
-      return { board, members, columns: columns.map(toColumn), cards: cards.map(toCard) };
+      return {
+        board,
+        revision,
+        members,
+        columns: columns.map(toColumn),
+        cards: cards.map(toCard),
+      };
     });
 }
 
@@ -226,23 +302,30 @@ export async function addMember(
   userId: string,
   boardId: string,
   email: string,
-): Promise<BoardMember> {
-  await requireMember(db, userId, boardId, { owner: true });
-  const user = await db
-    .selectFrom("users")
-    .select(["id", "email", "display_name"])
-    .where("email", "=", email.trim().toLowerCase())
-    .executeTakeFirst();
-  if (!user) throw new StoreError("not_found", "no account uses that email");
-  const inserted = await db
-    .insertInto("board_members")
-    .values({ board_id: boardId, user_id: user.id, role: "editor" })
-    .onConflict((oc) => oc.columns(["board_id", "user_id"]).doNothing())
-    .executeTakeFirst();
-  if (inserted.numInsertedOrUpdatedRows === 0n) {
-    throw new StoreError("conflict", "that person is already on this board");
-  }
-  return { userId: user.id, email: user.email, displayName: user.display_name, role: "editor" };
+): Promise<Revisioned<{ member: BoardMember; boardName: string }>> {
+  return writeBoard(db, userId, boardId, { owner: true }, async (trx, board) => {
+    const user = await trx
+      .selectFrom("users")
+      .select(["id", "email", "display_name"])
+      .where("email", "=", email.trim().toLowerCase())
+      .executeTakeFirst();
+    if (!user) throw new StoreError("not_found", "no account uses that email");
+    const inserted = await trx
+      .insertInto("board_members")
+      .values({ board_id: boardId, user_id: user.id, role: "editor" })
+      .onConflict((oc) => oc.columns(["board_id", "user_id"]).doNothing())
+      .executeTakeFirst();
+    if (inserted.numInsertedOrUpdatedRows === 0n) {
+      throw new StoreError("conflict", "that person is already on this board");
+    }
+    const member: BoardMember = {
+      userId: user.id,
+      email: user.email,
+      displayName: user.display_name,
+      role: "editor",
+    };
+    return { member, boardName: board.name };
+  });
 }
 
 // ---- columns -------------------------------------------------------------
@@ -252,9 +335,8 @@ export async function createColumn(
   userId: string,
   boardId: string,
   name: string,
-): Promise<Column> {
-  return db.transaction().execute(async (trx) => {
-    await requireMember(trx, userId, boardId, { lock: true });
+): Promise<Revisioned<Column>> {
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
     const last = await trx
       .selectFrom("board_columns")
       .select("position")
@@ -280,10 +362,18 @@ export async function renameColumn(
   userId: string,
   columnId: string,
   name: string,
-): Promise<Column> {
-  const column = await requireColumn(db, userId, columnId);
-  await db.updateTable("board_columns").set({ name }).where("id", "=", columnId).execute();
-  return toColumn({ ...column, name });
+): Promise<Revisioned<Column>> {
+  const boardId = await boardOfColumn(db, columnId);
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
+    const row = await trx
+      .updateTable("board_columns")
+      .set({ name })
+      .where("id", "=", columnId)
+      .returning(COLUMN_FIELDS)
+      .executeTakeFirst();
+    if (!row) throw new StoreError("not_found", "column not found");
+    return toColumn(row);
+  });
 }
 
 export async function moveColumn(
@@ -291,30 +381,47 @@ export async function moveColumn(
   userId: string,
   columnId: string,
   toIndex: number,
-): Promise<Column> {
-  return db.transaction().execute(async (trx) => {
-    const column = await findColumn(trx, columnId);
-    await requireMember(trx, userId, column.board_id, { lock: true });
+): Promise<Revisioned<Column>> {
+  const boardId = await boardOfColumn(db, columnId);
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
     const others = await trx
       .selectFrom("board_columns")
       .select("position")
-      .where("board_id", "=", column.board_id)
+      .where("board_id", "=", boardId)
       .where("id", "!=", columnId)
       .orderBy("position")
       .execute();
-    const position = positionAt(
-      others.map((c) => c.position),
-      toIndex,
-    );
-    await trx.updateTable("board_columns").set({ position }).where("id", "=", columnId).execute();
-    return toColumn({ ...column, position });
+    const row = await trx
+      .updateTable("board_columns")
+      .set({
+        position: positionAt(
+          others.map((c) => c.position),
+          toIndex,
+        ),
+      })
+      .where("id", "=", columnId)
+      .returning(COLUMN_FIELDS)
+      .executeTakeFirst();
+    if (!row) throw new StoreError("not_found", "column not found");
+    return toColumn(row);
   });
 }
 
-export async function deleteColumn(db: DB, userId: string, columnId: string): Promise<Column> {
-  const column = await requireColumn(db, userId, columnId);
-  await db.deleteFrom("board_columns").where("id", "=", columnId).execute();
-  return toColumn(column);
+export async function deleteColumn(
+  db: DB,
+  userId: string,
+  columnId: string,
+): Promise<Revisioned<Column>> {
+  const boardId = await boardOfColumn(db, columnId);
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
+    const row = await trx
+      .deleteFrom("board_columns")
+      .where("id", "=", columnId)
+      .returning(COLUMN_FIELDS)
+      .executeTakeFirst();
+    if (!row) throw new StoreError("not_found", "column not found");
+    return toColumn(row);
+  });
 }
 
 // ---- cards ---------------------------------------------------------------
@@ -324,10 +431,10 @@ export async function createCard(
   userId: string,
   columnId: string,
   title: string,
-): Promise<Card> {
-  return db.transaction().execute(async (trx) => {
-    const column = await findColumn(trx, columnId, { lock: true });
-    await requireMember(trx, userId, column.board_id);
+): Promise<Revisioned<Card>> {
+  const boardId = await boardOfColumn(db, columnId);
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
+    await findColumn(trx, columnId); // still there?
     const last = await trx
       .selectFrom("cards")
       .select("position")
@@ -338,7 +445,7 @@ export async function createCard(
     const row = await trx
       .insertInto("cards")
       .values({
-        board_id: column.board_id,
+        board_id: boardId,
         column_id: columnId,
         title,
         position: generateKeyBetween(last?.position ?? null, null),
@@ -354,21 +461,22 @@ export async function updateCard(
   userId: string,
   cardId: string,
   changes: { title?: string | undefined; description?: string | undefined },
-): Promise<Card> {
-  const card = await requireCard(db, userId, cardId);
-  const set = {
-    ...(changes.title === undefined ? {} : { title: changes.title }),
-    ...(changes.description === undefined ? {} : { description: changes.description }),
-  };
-  if (Object.keys(set).length === 0) return toCard(card);
-  const row = await db
-    .updateTable("cards")
-    .set({ ...set, updated_at: new Date() })
-    .where("id", "=", cardId)
-    .returning(CARD_FIELDS)
-    .executeTakeFirst();
-  if (!row) throw new StoreError("not_found", "card not found");
-  return toCard(row);
+): Promise<Revisioned<Card>> {
+  const boardId = await boardOfCard(db, cardId);
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
+    const row = await trx
+      .updateTable("cards")
+      .set({
+        ...(changes.title === undefined ? {} : { title: changes.title }),
+        ...(changes.description === undefined ? {} : { description: changes.description }),
+        updated_at: new Date(),
+      })
+      .where("id", "=", cardId)
+      .returning(CARD_FIELDS)
+      .executeTakeFirst();
+    if (!row) throw new StoreError("not_found", "card not found");
+    return toCard(row);
+  });
 }
 
 export async function moveCard(
@@ -377,12 +485,11 @@ export async function moveCard(
   cardId: string,
   toColumnId: string,
   toIndex: number,
-): Promise<Card> {
-  return db.transaction().execute(async (trx) => {
-    const card = await findCard(trx, cardId);
-    await requireMember(trx, userId, card.board_id);
-    const target = await findColumn(trx, toColumnId, { lock: true });
-    if (target.board_id !== card.board_id) throw new StoreError("not_found", "column not found");
+): Promise<Revisioned<Card>> {
+  const boardId = await boardOfCard(db, cardId);
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
+    const target = await findColumn(trx, toColumnId);
+    if (target.board_id !== boardId) throw new StoreError("not_found", "column not found");
     const others = await trx
       .selectFrom("cards")
       .select("position")
@@ -390,13 +497,16 @@ export async function moveCard(
       .where("id", "!=", cardId)
       .orderBy("position")
       .execute();
-    const position = positionAt(
-      others.map((c) => c.position),
-      toIndex,
-    );
     const row = await trx
       .updateTable("cards")
-      .set({ column_id: toColumnId, position, updated_at: new Date() })
+      .set({
+        column_id: toColumnId,
+        position: positionAt(
+          others.map((c) => c.position),
+          toIndex,
+        ),
+        updated_at: new Date(),
+      })
       .where("id", "=", cardId)
       .returning(CARD_FIELDS)
       .executeTakeFirst();
@@ -405,8 +515,19 @@ export async function moveCard(
   });
 }
 
-export async function deleteCard(db: DB, userId: string, cardId: string): Promise<Card> {
-  const card = await requireCard(db, userId, cardId);
-  await db.deleteFrom("cards").where("id", "=", cardId).execute();
-  return toCard(card);
+export async function deleteCard(
+  db: DB,
+  userId: string,
+  cardId: string,
+): Promise<Revisioned<Card>> {
+  const boardId = await boardOfCard(db, cardId);
+  return writeBoard(db, userId, boardId, {}, async (trx) => {
+    const row = await trx
+      .deleteFrom("cards")
+      .where("id", "=", cardId)
+      .returning(CARD_FIELDS)
+      .executeTakeFirst();
+    if (!row) throw new StoreError("not_found", "card not found");
+    return toCard(row);
+  });
 }

@@ -30,6 +30,7 @@ import {
 import { EmailTakenError, authenticate, createUser } from "./auth/users.ts";
 import { StoreError } from "./boards/store.ts";
 import { handleRequest } from "./ws/handlers.ts";
+import { Hub } from "./ws/hub.ts";
 
 export const WS_PATH = "/ws";
 
@@ -93,9 +94,11 @@ async function readJson<T>(req: IncomingMessage, schema: z.ZodType<T>): Promise<
 export function createAppServer(
   config: ServerConfig,
   db: DB,
-): { http: Server; wss: WebSocketServer } {
+): { http: Server; wss: WebSocketServer; hub: Hub } {
   const isAllowedOrigin = (origin: string | undefined) =>
     config.allowedOrigins.length === 0 || (!!origin && config.allowedOrigins.includes(origin));
+
+  const hub = new Hub();
 
   /** Open sockets per session, so logging out also disconnects them. */
   const socketsBySession = new Map<string, Set<WebSocket>>();
@@ -243,7 +246,9 @@ export function createAppServer(
     const sessionSockets = socketsBySession.get(session.id) ?? new Set();
     sessionSockets.add(socket);
     socketsBySession.set(session.id, sessionSockets);
+    hub.add(socket, session.user);
     socket.on("close", () => {
+      hub.remove(socket);
       sessionSockets.delete(socket);
       if (sessionSockets.size === 0) socketsBySession.delete(session.id);
     });
@@ -285,7 +290,7 @@ export function createAppServer(
           socket.close(CLOSE_SESSION_ENDED, "session ended");
           return;
         }
-        const events = await handleRequest(db, session.user, msg);
+        const events = await handleRequest({ db, hub, user: session.user, socket }, msg);
         for (const event of events) send(socket, { ...event, requestId: msg.requestId });
         send(socket, { type: "ack", requestId: msg.requestId });
       } catch (err) {
@@ -334,5 +339,5 @@ export function createAppServer(
     });
   });
 
-  return { http, wss };
+  return { http, wss, hub };
 }

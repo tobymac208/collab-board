@@ -48,6 +48,10 @@ export const BoardMember = z.object({
 });
 export type BoardMember = z.infer<typeof BoardMember>;
 
+/** Someone who currently has a board open. */
+export const Viewer = z.object({ userId: id, displayName: z.string() });
+export type Viewer = z.infer<typeof Viewer>;
+
 /**
  * Columns and cards are ordered by `position`: a fractional index key that
  * sorts with plain byte-wise string comparison (not locale-aware comparison).
