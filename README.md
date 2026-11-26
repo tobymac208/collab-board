@@ -7,9 +7,9 @@ The interesting part is the sync engine, not the kanban UI. This project is buil
 one taking on a harder problem in real-time collaboration: conflict handling, ordering under
 concurrent edits, reconnects and offline edits, CRDTs, and horizontal scaling.
 
-> **Status:** phase 2. Everyone viewing a board sees each other's changes live, along with
-> who else is there. Edits aren't optimistic yet, and conflicting edits are last-writer-wins;
-> that's phase 3.
+> **Status:** phase 3. Changes show up instantly and roll back if the server rejects them,
+> concurrent edits to a card merge field by field (or ask when they clash), and drops keep
+> their place next to the neighbours you saw. Reconnecting and offline edits are next (phase 4).
 
 ## Architecture
 
@@ -45,7 +45,19 @@ concurrent edits, reconnects and offline edits, CRDTs, and horizontal scaling.
   which also queues concurrent writes to one board. Events carry their revision; clients apply
   them in order, hold back early arrivals, and reload the board if a gap doesn't fill.
 - **Presence:** the board header shows who has the board open, once per person however many
-  tabs they use.
+  tabs they use. Cards show who else has them open, and so does the card editor.
+- **Optimistic updates:** your own changes are kept as pending operations and replayed on top
+  of the server-confirmed state, so they show instantly, other people's changes slot in
+  underneath, and a rejected change just disappears. New cards and columns get their id from
+  the browser so they can be shown before the server replies.
+- **Conflicts:** cards have a version, and each field remembers the version it last changed
+  at. An edit says which version each field started from; if someone else changed that field
+  since, the server rejects it with the field names and the editor shows "theirs vs mine".
+  Edits to different fields merge.
+- **Moves by neighbour:** a drop names the items directly above and below it, not an index.
+  The server (and the browser's prediction, using the same code) places the item right after
+  the upper neighbour, or before the lower one if that's gone, so concurrent edits don't shift
+  it.
 - **Ordering** uses [fractional indexing](https://github.com/rocicorp/fractional-indexing): each
   column and card has a string `position`, and a move writes only the moved row. Positions use
   `COLLATE "C"` so Postgres sorts them byte-wise, matching the client.
@@ -82,8 +94,8 @@ pnpm dev          # web on http://localhost:3000, server on http://localhost:400
 | ----------------------- | ----------------------------------------------------------------------------- |
 | 0. Skeleton ✅          | Monorepo, WebSocket handshake, protocol validation, CI                        |
 | 1. Foundation ✅        | Auth, boards, columns, cards, drag and drop, Postgres                         |
-| 2. Real-time 🚧         | Broadcast board changes to everyone viewing a board                           |
-| 3. Correctness          | Optimistic updates, conflict handling, stable ordering under concurrent edits |
+| 2. Real-time ✅         | Broadcast board changes to everyone viewing a board                           |
+| 3. Correctness 🚧       | Optimistic updates, conflict handling, stable ordering under concurrent edits |
 | 4. Resilience           | Reconnect and catch up on missed changes, offline edits                       |
 | 5. Collaboration engine | CRDTs (Yjs first, then a hand-rolled version)                                 |
 | 6. Scale                | Multiple server instances with Redis pub/sub, load tests, metrics             |

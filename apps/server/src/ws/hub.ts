@@ -9,12 +9,12 @@ import type { ServerEvent, User, Viewer } from "@collab/shared";
  * puts Redis pub/sub behind the same methods to span several servers.
  */
 export class Hub {
-  #sockets = new Map<WebSocket, { user: User; boardId: string | null }>();
+  #sockets = new Map<WebSocket, { user: User; boardId: string | null; cardId: string | null }>();
   #byUser = new Map<string, Set<WebSocket>>();
   #byBoard = new Map<string, Set<WebSocket>>();
 
   add(socket: WebSocket, user: User): void {
-    this.#sockets.set(socket, { user, boardId: null });
+    this.#sockets.set(socket, { user, boardId: null, cardId: null });
     addTo(this.#byUser, user.id, socket);
   }
 
@@ -33,6 +33,7 @@ export class Hub {
     if (!entry || entry.boardId === boardId) return;
     this.#leave(socket);
     entry.boardId = boardId;
+    entry.cardId = null;
     addTo(this.#byBoard, boardId, socket);
     this.#broadcastPresence(boardId);
   }
@@ -42,11 +43,22 @@ export class Hub {
     if (this.#sockets.get(socket)?.boardId === boardId) this.#leave(socket);
   }
 
+  /** Records which card a viewer has open, if they're viewing that board. */
+  focus(socket: WebSocket, boardId: string, cardId: string | null): void {
+    const entry = this.#sockets.get(socket);
+    if (!entry || entry.boardId !== boardId || entry.cardId === cardId) return;
+    entry.cardId = cardId;
+    this.#broadcastPresence(boardId);
+  }
+
   /** Unsubscribes everyone from a board that no longer exists. */
   dropBoard(boardId: string): void {
     for (const socket of this.#byBoard.get(boardId) ?? []) {
       const entry = this.#sockets.get(socket);
-      if (entry) entry.boardId = null;
+      if (entry) {
+        entry.boardId = null;
+        entry.cardId = null;
+      }
     }
     this.#byBoard.delete(boardId);
   }
@@ -61,12 +73,22 @@ export class Hub {
     send(this.#byUser.get(userId), event, except);
   }
 
-  /** Everyone viewing a board, once per person however many tabs they have. */
+  /**
+   * Everyone viewing a board, once per person however many tabs they have,
+   * with the cards they have open across those tabs.
+   */
   viewers(boardId: string): Viewer[] {
     const people = new Map<string, Viewer>();
     for (const socket of this.#byBoard.get(boardId) ?? []) {
-      const user = this.#sockets.get(socket)?.user;
-      if (user) people.set(user.id, { userId: user.id, displayName: user.displayName });
+      const entry = this.#sockets.get(socket);
+      if (!entry) continue;
+      const viewer = people.get(entry.user.id) ?? {
+        userId: entry.user.id,
+        displayName: entry.user.displayName,
+        cardIds: [],
+      };
+      if (entry.cardId && !viewer.cardIds.includes(entry.cardId)) viewer.cardIds.push(entry.cardId);
+      people.set(entry.user.id, viewer);
     }
     return [...people.values()];
   }
@@ -76,6 +98,7 @@ export class Hub {
     if (!entry?.boardId) return;
     const boardId = entry.boardId;
     entry.boardId = null;
+    entry.cardId = null;
     removeFrom(this.#byBoard, boardId, socket);
     this.#broadcastPresence(boardId);
   }

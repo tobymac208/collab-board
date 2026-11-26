@@ -1,6 +1,15 @@
 import { sql } from "kysely";
-import { generateKeyBetween, generateNKeysBetween } from "fractional-indexing";
-import type { BoardMember, BoardRole, BoardSummary, Card, Column } from "@collab/shared";
+import {
+  initialPositions,
+  positionAtEnd,
+  positionBetweenNeighbours,
+  type BoardMember,
+  type BoardRole,
+  type BoardSummary,
+  type Card,
+  type CardField,
+  type Column,
+} from "@collab/shared";
 import type { DB } from "../db/schema.ts";
 
 /**
@@ -13,15 +22,23 @@ import type { DB } from "../db/schema.ts";
  * time, so revisions are gap-free and follow commit order, and two writers
  * can never pick the same position key.
  *
- * Ordering: columns and cards carry fractional index keys. A move computes a
- * key between the neighbours at the target index, so only the moved row is
- * written. Phase 3 revisits ordering under concurrent edits.
+ * Ordering: columns and cards carry fractional index keys, so a move writes
+ * only the moved row. Moves name the neighbours the user dropped the item
+ * between; see `positionBetweenNeighbours` for how that survives concurrent
+ * edits.
+ *
+ * Conflicts: card fields remember the card version at which they last
+ * changed. An edit based on an older version is rejected only for fields
+ * that changed since (and only if the values differ), so concurrent edits to
+ * different fields merge.
  */
 
 export class StoreError extends Error {
   constructor(
     readonly code: "not_found" | "forbidden" | "conflict",
     message: string,
+    /** For edit conflicts: the card fields someone else changed meanwhile. */
+    readonly conflictingFields?: CardField[],
   ) {
     super(message);
   }
@@ -36,16 +53,15 @@ export interface Revisioned<T> {
 
 const DEFAULT_COLUMNS = ["To do", "In progress", "Done"];
 
-/** A key that sorts at `index` in an already-sorted list of keys. */
-export function positionAt(sorted: readonly string[], index: number): string {
-  const i = Math.min(index, sorted.length);
-  return generateKeyBetween(sorted[i - 1] ?? null, sorted[i] ?? null);
-}
-
 // ---- row mappers ---------------------------------------------------------
 
 type ColumnRow = { id: string; board_id: string; name: string; position: string };
-type CardRow = Omit<ColumnRow, "name"> & { column_id: string; title: string; description: string };
+type CardRow = Omit<ColumnRow, "name"> & {
+  column_id: string;
+  title: string;
+  description: string;
+  version: number;
+};
 
 const toColumn = (r: ColumnRow): Column => ({
   id: r.id,
@@ -61,10 +77,19 @@ const toCard = (r: CardRow): Card => ({
   title: r.title,
   description: r.description,
   position: r.position,
+  version: r.version,
 });
 
 const COLUMN_FIELDS = ["id", "board_id", "name", "position"] as const;
-const CARD_FIELDS = ["id", "board_id", "column_id", "title", "description", "position"] as const;
+const CARD_FIELDS = [
+  "id",
+  "board_id",
+  "column_id",
+  "title",
+  "description",
+  "position",
+  "version",
+] as const;
 
 // ---- access checks -------------------------------------------------------
 
@@ -198,7 +223,7 @@ export async function createBoard(
       .insertInto("board_members")
       .values({ board_id: board.id, user_id: userId, role: "owner" })
       .execute();
-    const positions = generateNKeysBetween(null, null, DEFAULT_COLUMNS.length);
+    const positions = initialPositions(DEFAULT_COLUMNS.length);
     await trx
       .insertInto("board_columns")
       .values(
@@ -339,24 +364,22 @@ export async function createColumn(
   userId: string,
   boardId: string,
   name: string,
+  id?: string,
 ): Promise<Revisioned<Column>> {
   return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const last = await trx
+    const siblings = await trx
       .selectFrom("board_columns")
-      .select("position")
+      .select(["id", "position"])
       .where("board_id", "=", boardId)
-      .orderBy("position", "desc")
-      .limit(1)
-      .executeTakeFirst();
+      .orderBy("position")
+      .execute();
     const row = await trx
       .insertInto("board_columns")
-      .values({
-        board_id: boardId,
-        name,
-        position: generateKeyBetween(last?.position ?? null, null),
-      })
+      .values({ ...(id ? { id } : {}), board_id: boardId, name, position: positionAtEnd(siblings) })
+      .onConflict((oc) => oc.column("id").doNothing())
       .returning(COLUMN_FIELDS)
-      .executeTakeFirstOrThrow();
+      .executeTakeFirst();
+    if (!row) throw new StoreError("conflict", "that id is already in use");
     return toColumn(row);
   });
 }
@@ -384,25 +407,21 @@ export async function moveColumn(
   db: DB,
   userId: string,
   columnId: string,
-  toIndex: number,
+  afterId: string | null,
+  beforeId: string | null,
 ): Promise<Revisioned<Column>> {
   const boardId = await boardOfColumn(db, columnId);
   return writeBoard(db, userId, boardId, {}, async (trx) => {
-    const others = await trx
+    const siblings = await trx
       .selectFrom("board_columns")
-      .select("position")
+      .select(["id", "position"])
       .where("board_id", "=", boardId)
       .where("id", "!=", columnId)
       .orderBy("position")
       .execute();
     const row = await trx
       .updateTable("board_columns")
-      .set({
-        position: positionAt(
-          others.map((c) => c.position),
-          toIndex,
-        ),
-      })
+      .set({ position: positionBetweenNeighbours(siblings, afterId, beforeId) })
       .where("id", "=", columnId)
       .returning(COLUMN_FIELDS)
       .executeTakeFirst();
@@ -435,50 +454,84 @@ export async function createCard(
   userId: string,
   columnId: string,
   title: string,
+  id?: string,
 ): Promise<Revisioned<Card>> {
   const boardId = await boardOfColumn(db, columnId);
   return writeBoard(db, userId, boardId, {}, async (trx) => {
     await findColumn(trx, columnId); // still there?
-    const last = await trx
+    const siblings = await trx
       .selectFrom("cards")
-      .select("position")
+      .select(["id", "position"])
       .where("column_id", "=", columnId)
-      .orderBy("position", "desc")
-      .limit(1)
-      .executeTakeFirst();
+      .orderBy("position")
+      .execute();
     const row = await trx
       .insertInto("cards")
       .values({
+        ...(id ? { id } : {}),
         board_id: boardId,
         column_id: columnId,
         title,
-        position: generateKeyBetween(last?.position ?? null, null),
+        position: positionAtEnd(siblings),
       })
+      .onConflict((oc) => oc.column("id").doNothing())
       .returning(CARD_FIELDS)
-      .executeTakeFirstOrThrow();
+      .executeTakeFirst();
+    if (!row) throw new StoreError("conflict", "that id is already in use");
     return toCard(row);
   });
 }
+
+export type CardEdit = Partial<Record<CardField, { value: string; baseVersion: number }>>;
 
 export async function updateCard(
   db: DB,
   userId: string,
   cardId: string,
-  changes: { title?: string | undefined; description?: string | undefined },
+  edit: CardEdit,
 ): Promise<Revisioned<Card>> {
   const boardId = await boardOfCard(db, cardId);
   return writeBoard(db, userId, boardId, {}, async (trx) => {
+    // The board lock taken by writeBoard keeps this row stable until commit.
+    const current = await trx
+      .selectFrom("cards")
+      .select([...CARD_FIELDS, "title_version", "description_version"])
+      .where("id", "=", cardId)
+      .executeTakeFirst();
+    if (!current) throw new StoreError("not_found", "card not found");
+    const fieldVersion = { title: current.title_version, description: current.description_version };
+
+    const changed: CardField[] = [];
+    const conflicts: CardField[] = [];
+    for (const field of ["title", "description"] as const) {
+      const change = edit[field];
+      if (!change || change.value === current[field]) continue; // nothing to do
+      if (fieldVersion[field] > change.baseVersion) conflicts.push(field);
+      else changed.push(field);
+    }
+    if (conflicts.length > 0) {
+      throw new StoreError(
+        "conflict",
+        "someone else changed this card while you were editing",
+        conflicts,
+      );
+    }
+    if (changed.length === 0) return toCard(current);
+
+    const version = current.version + 1;
     const row = await trx
       .updateTable("cards")
       .set({
-        ...(changes.title === undefined ? {} : { title: changes.title }),
-        ...(changes.description === undefined ? {} : { description: changes.description }),
+        version,
         updated_at: new Date(),
+        ...(changed.includes("title") ? { title: edit.title!.value, title_version: version } : {}),
+        ...(changed.includes("description")
+          ? { description: edit.description!.value, description_version: version }
+          : {}),
       })
       .where("id", "=", cardId)
       .returning(CARD_FIELDS)
-      .executeTakeFirst();
-    if (!row) throw new StoreError("not_found", "card not found");
+      .executeTakeFirstOrThrow();
     return toCard(row);
   });
 }
@@ -488,15 +541,16 @@ export async function moveCard(
   userId: string,
   cardId: string,
   toColumnId: string,
-  toIndex: number,
+  afterId: string | null,
+  beforeId: string | null,
 ): Promise<Revisioned<Card>> {
   const boardId = await boardOfCard(db, cardId);
   return writeBoard(db, userId, boardId, {}, async (trx) => {
     const target = await findColumn(trx, toColumnId);
     if (target.board_id !== boardId) throw new StoreError("not_found", "column not found");
-    const others = await trx
+    const siblings = await trx
       .selectFrom("cards")
-      .select("position")
+      .select(["id", "position"])
       .where("column_id", "=", toColumnId)
       .where("id", "!=", cardId)
       .orderBy("position")
@@ -505,10 +559,8 @@ export async function moveCard(
       .updateTable("cards")
       .set({
         column_id: toColumnId,
-        position: positionAt(
-          others.map((c) => c.position),
-          toIndex,
-        ),
+        position: positionBetweenNeighbours(siblings, afterId, beforeId),
+        version: sql<number>`version + 1`,
         updated_at: new Date(),
       })
       .where("id", "=", cardId)

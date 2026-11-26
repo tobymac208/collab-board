@@ -187,9 +187,6 @@ importers:
       '@collab/shared':
         specifier: workspace:*
         version: link:../../packages/shared
-      fractional-indexing:
-        specifier: ^4.0.0
-        version: 4.0.0
       kysely:
         specifier: ^0.29.9
         version: 0.29.9
@@ -279,6 +276,9 @@ importers:
 
   packages/shared:
     dependencies:
+      fractional-indexing:
+        specifier: ^4.0.0
+        version: 4.0.0
       zod:
         specifier: ^4
         version: 4.6.7

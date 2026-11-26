@@ -1,9 +1,12 @@
 import {
   comparePositions,
+  positionAtEnd,
+  positionBetweenNeighbours,
   type BoardChangeEvent,
   type BoardMember,
   type BoardSummary,
   type Card,
+  type ClientRequestBody,
   type Column,
   type ServerEvent,
   type Viewer,
@@ -35,9 +38,185 @@ export interface BoardSync {
   viewers: Viewer[];
   /** The board was deleted while open. */
   deleted: boolean;
+  /** This client's own changes the server hasn't confirmed yet (see `viewOf`). */
+  ops: LocalOp[];
 }
 
-export const initialSync: BoardSync = { data: null, pending: [], viewers: [], deleted: false };
+export const initialSync: BoardSync = {
+  data: null,
+  pending: [],
+  viewers: [],
+  deleted: false,
+  ops: [],
+};
+
+// ---- optimistic updates --------------------------------------------------
+//
+// `data` holds only what the server has confirmed. Our own changes are kept
+// as a list of operations and replayed on top of it to produce what we show
+// (`viewOf`). Because they're replayed rather than baked in, changes from
+// other people slot in underneath ours and nothing has to be untangled when
+// the server answers:
+//
+// - on success, the op is dropped once `data` reaches the revision of the
+//   server's reply, which by then contains the same change;
+// - on failure, the op is dropped straight away, which rolls it back.
+
+/** Requests that change board state and can be predicted locally. */
+export type BoardOp = Extract<
+  ClientRequestBody,
+  {
+    type:
+      | "rename_board"
+      | "create_column"
+      | "rename_column"
+      | "move_column"
+      | "delete_column"
+      | "create_card"
+      | "update_card"
+      | "move_card"
+      | "delete_card";
+  }
+>;
+
+export interface LocalOp {
+  key: number;
+  op: BoardOp;
+  /** Set when the server accepted it: the revision its reply produced. */
+  confirmedAt?: number;
+}
+
+export type BoardAction =
+  | { kind: "event"; event: ServerEvent }
+  | { kind: "op_started"; key: number; op: BoardOp }
+  | { kind: "op_confirmed"; key: number; revision: number }
+  | { kind: "op_failed"; key: number };
+
+const sortedCards = (state: BoardState, columnId: string, except?: string) =>
+  Object.values(state.cards)
+    .filter((c) => c.columnId === columnId && c.id !== except)
+    .sort(comparePositions);
+
+const sortedColumns = (state: BoardState, except?: string) =>
+  Object.values(state.columns)
+    .filter((c) => c.id !== except)
+    .sort(comparePositions);
+
+/**
+ * Predicts the effect of one of our own requests. Uses the same placement
+ * rules as the server, so the prediction usually matches exactly. If the
+ * thing it refers to is gone, it does nothing; the server will reject it.
+ */
+export function applyLocal(state: BoardState, op: BoardOp): BoardState {
+  switch (op.type) {
+    case "rename_board":
+      return { ...state, board: { ...state.board, name: op.name } };
+
+    case "create_column": {
+      if (!op.id) return state;
+      const column: Column = {
+        id: op.id,
+        boardId: state.board.id,
+        name: op.name,
+        position: positionAtEnd(sortedColumns(state)),
+      };
+      return { ...state, columns: { ...state.columns, [column.id]: column } };
+    }
+    case "rename_column": {
+      const column = state.columns[op.columnId];
+      if (!column) return state;
+      return { ...state, columns: { ...state.columns, [column.id]: { ...column, name: op.name } } };
+    }
+    case "move_column": {
+      const column = state.columns[op.columnId];
+      if (!column) return state;
+      const position = positionBetweenNeighbours(
+        sortedColumns(state, column.id),
+        op.afterId,
+        op.beforeId,
+      );
+      return { ...state, columns: { ...state.columns, [column.id]: { ...column, position } } };
+    }
+    case "delete_column": {
+      if (!state.columns[op.columnId]) return state;
+      const cards = Object.fromEntries(
+        Object.entries(state.cards).filter(([, card]) => card.columnId !== op.columnId),
+      );
+      return { ...state, columns: without(state.columns, op.columnId), cards };
+    }
+
+    case "create_card": {
+      if (!op.id || !state.columns[op.columnId]) return state;
+      const card: Card = {
+        id: op.id,
+        boardId: state.board.id,
+        columnId: op.columnId,
+        title: op.title,
+        description: "",
+        position: positionAtEnd(sortedCards(state, op.columnId)),
+        version: 0,
+      };
+      return { ...state, cards: { ...state.cards, [card.id]: card } };
+    }
+    case "update_card": {
+      const card = state.cards[op.cardId];
+      if (!card) return state;
+      const next = {
+        ...card,
+        ...(op.title ? { title: op.title.value } : {}),
+        ...(op.description ? { description: op.description.value } : {}),
+      };
+      return { ...state, cards: { ...state.cards, [card.id]: next } };
+    }
+    case "move_card": {
+      const card = state.cards[op.cardId];
+      if (!card || !state.columns[op.toColumnId]) return state;
+      const position = positionBetweenNeighbours(
+        sortedCards(state, op.toColumnId, card.id),
+        op.afterId,
+        op.beforeId,
+      );
+      return {
+        ...state,
+        cards: { ...state.cards, [card.id]: { ...card, columnId: op.toColumnId, position } },
+      };
+    }
+    case "delete_card":
+      return state.cards[op.cardId] ? { ...state, cards: without(state.cards, op.cardId) } : state;
+  }
+}
+
+/** What to show: confirmed state with our unconfirmed changes on top. */
+export function viewOf(sync: BoardSync): BoardState | null {
+  if (!sync.data) return null;
+  return sync.ops.reduce((state, { op }) => applyLocal(state, op), sync.data);
+}
+
+/** Drops confirmed ops whose effect the confirmed state now includes. */
+function pruneOps(sync: BoardSync): BoardSync {
+  const revision = sync.data?.revision ?? -1;
+  const ops = sync.ops.filter((o) => o.confirmedAt === undefined || o.confirmedAt > revision);
+  return ops.length === sync.ops.length ? sync : { ...sync, ops };
+}
+
+/** The board reducer: server events plus the lifecycle of our own changes. */
+export function boardReducer(sync: BoardSync, action: BoardAction, boardId: string): BoardSync {
+  switch (action.kind) {
+    case "event":
+      return pruneOps(syncReducer(sync, action.event, boardId));
+    case "op_started":
+      return { ...sync, ops: [...sync.ops, { key: action.key, op: action.op }] };
+    case "op_confirmed":
+      return pruneOps({
+        ...sync,
+        ops: sync.ops.map((o) =>
+          o.key === action.key ? { ...o, confirmedAt: action.revision } : o,
+        ),
+      });
+    case "op_failed":
+      return { ...sync, ops: sync.ops.filter((o) => o.key !== action.key) };
+  }
+}
 
 const byId = <T extends { id: string }>(items: T[]): Record<string, T> =>
   Object.fromEntries(items.map((item) => [item.id, item]));

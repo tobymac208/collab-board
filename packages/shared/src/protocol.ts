@@ -1,5 +1,14 @@
 import { z } from "zod";
-import { BoardMember, BoardSummary, Card, Column, User, Viewer, fields } from "./model.ts";
+import {
+  BoardMember,
+  BoardSummary,
+  Card,
+  CardField,
+  Column,
+  User,
+  Viewer,
+  fields,
+} from "./model.ts";
 
 /**
  * Wire protocol between the browser and the WebSocket server.
@@ -23,9 +32,19 @@ import { BoardMember, BoardSummary, Card, Column, User, Viewer, fields } from ".
  * order, so clients apply them in revision order: ignore revisions they've
  * already seen, hold back early ones until the gap fills, and reload the
  * board if it doesn't.
+ *
+ * Optimistic updates: clients apply their own changes immediately and roll
+ * them back if the server rejects them. To make that possible, new cards and
+ * columns may carry a client-generated id, and moves name the neighbours the
+ * item was dropped between rather than an index, so the server can honour
+ * the user's intent even if the list changed meanwhile.
+ *
+ * Conflicts: card edits say which card version each field was based on. If
+ * someone else changed that field since, the edit is rejected with a
+ * `conflict` error listing the fields; edits to different fields merge.
  */
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 // ---- client -> server ----------------------------------------------------
 
@@ -51,18 +70,39 @@ export const ClientMessage = z.discriminatedUnion("type", [
   request("close_board", { boardId: fields.id }),
   request("add_member", { boardId: fields.id, email: fields.email }),
 
-  request("create_column", { boardId: fields.id, name: fields.columnName }),
+  /** Says which card this socket has open (null when none), for card presence. */
+  request("focus_card", { boardId: fields.id, cardId: fields.id.nullable() }),
+
+  request("create_column", {
+    boardId: fields.id,
+    name: fields.columnName,
+    /** Client-generated, so the column can be shown before the server replies. */
+    id: fields.id.optional(),
+  }),
   request("rename_column", { columnId: fields.id, name: fields.columnName }),
-  request("move_column", { columnId: fields.id, toIndex: fields.index }),
+  request("move_column", { columnId: fields.id, afterId: fields.anchor, beforeId: fields.anchor }),
   request("delete_column", { columnId: fields.id }),
 
-  request("create_card", { columnId: fields.id, title: fields.cardTitle }),
+  request("create_card", {
+    columnId: fields.id,
+    title: fields.cardTitle,
+    /** Client-generated, so the card can be shown before the server replies. */
+    id: fields.id.optional(),
+  }),
   request("update_card", {
     cardId: fields.id,
-    title: fields.cardTitle.optional(),
-    description: fields.cardDescription.optional(),
+    /** Each changed field, with the card version the edit to it started from. */
+    title: z.object({ value: fields.cardTitle, baseVersion: fields.version }).optional(),
+    description: z
+      .object({ value: fields.cardDescription, baseVersion: fields.version })
+      .optional(),
   }),
-  request("move_card", { cardId: fields.id, toColumnId: fields.id, toIndex: fields.index }),
+  request("move_card", {
+    cardId: fields.id,
+    toColumnId: fields.id,
+    afterId: fields.anchor,
+    beforeId: fields.anchor,
+  }),
   request("delete_card", { cardId: fields.id }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
@@ -142,6 +182,8 @@ export const ServerMessage = z.discriminatedUnion("type", [
     requestId: requestId.optional(),
     code: ErrorCode,
     message: z.string(),
+    /** For a `conflict` on update_card: the fields someone else changed meanwhile. */
+    conflictingFields: z.array(CardField).optional(),
   }),
   ...ServerEvent.options,
 ]);

@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "@collab/shared": "workspace:*",
-    "fractional-indexing": "^4.0.0",
     "kysely": "^0.29.9",
     "pg": "^8.23.1",
     "ws": "^8",

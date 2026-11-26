@@ -139,7 +139,12 @@ export async function connectClient(
         owner.resolve(owner.events);
       } else if (msg.type === "error") {
         pending.delete(msg.requestId);
-        owner.reject(Object.assign(new Error(msg.message), { code: msg.code }));
+        owner.reject(
+          Object.assign(new Error(msg.message), {
+            code: msg.code,
+            ...(msg.conflictingFields ? { conflictingFields: msg.conflictingFields } : {}),
+          }),
+        );
       } else {
         owner.events.push(msg);
       }

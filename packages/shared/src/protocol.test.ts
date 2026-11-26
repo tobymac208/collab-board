@@ -49,16 +49,31 @@ describe("parseClientMessage", () => {
     );
   });
 
-  it("rejects negative or fractional move indexes", () => {
+  it("takes neighbours (or null) for moves, not indexes", () => {
     const move = {
       type: "move_card",
       requestId: "r",
       cardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
       toColumnId: "1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
     };
-    expect(parseClientMessage(raw({ ...move, toIndex: 0 })).ok).toBe(true);
-    expect(parseClientMessage(raw({ ...move, toIndex: -1 })).ok).toBe(false);
-    expect(parseClientMessage(raw({ ...move, toIndex: 1.5 })).ok).toBe(false);
+    const other = "2a3b4c5d-6e7f-4809-9a1b-2c3d4e5f6a7b";
+    expect(parseClientMessage(raw({ ...move, afterId: other, beforeId: null })).ok).toBe(true);
+    expect(parseClientMessage(raw({ ...move, afterId: null, beforeId: null })).ok).toBe(true);
+    expect(parseClientMessage(raw({ ...move, afterId: "x", beforeId: null })).ok).toBe(false);
+    expect(parseClientMessage(raw({ ...move, toIndex: 0 })).ok).toBe(false);
+  });
+
+  it("requires a base version for each edited card field", () => {
+    const update = {
+      type: "update_card",
+      requestId: "r",
+      cardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
+    };
+    expect(parseClientMessage(raw({ ...update, title: { value: "New", baseVersion: 3 } })).ok).toBe(
+      true,
+    );
+    expect(parseClientMessage(raw({ ...update, title: "New" })).ok).toBe(false);
+    expect(parseClientMessage(raw({ ...update, title: { value: "New" } })).ok).toBe(false);
   });
 });
 
@@ -81,6 +96,7 @@ describe("parseServerMessage", () => {
       title: "Write tests",
       description: "",
       position: "a0",
+      version: 0,
     };
     expect(parseServerMessage(raw({ type: "card_upserted", card, revision: 4 })).ok).toBe(true);
   });
@@ -93,6 +109,7 @@ describe("parseServerMessage", () => {
       title: "t",
       description: "",
       position: "a0",
+      version: 0,
     };
     expect(parseServerMessage(raw({ type: "card_upserted", card })).ok).toBe(false);
     expect(parseServerMessage(raw({ type: "card_upserted", card, revision: -1 })).ok).toBe(false);
@@ -102,7 +119,7 @@ describe("parseServerMessage", () => {
     const msg = {
       type: "presence",
       boardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
-      viewers: [{ userId: "u1", displayName: "Ada" }],
+      viewers: [{ userId: "u1", displayName: "Ada", cardIds: [] }],
     };
     expect(parseServerMessage(raw(msg))).toEqual({ ok: true, value: msg });
   });

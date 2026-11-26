@@ -49,7 +49,12 @@ export const BoardMember = z.object({
 export type BoardMember = z.infer<typeof BoardMember>;
 
 /** Someone who currently has a board open. */
-export const Viewer = z.object({ userId: id, displayName: z.string() });
+export const Viewer = z.object({
+  userId: id,
+  displayName: z.string(),
+  /** Cards this person has open (one per tab), so others can see who's editing what. */
+  cardIds: z.array(id),
+});
 export type Viewer = z.infer<typeof Viewer>;
 
 /**
@@ -71,8 +76,14 @@ export const Card = z.object({
   title: z.string(),
   description: z.string(),
   position: z.string(),
+  /** Incremented by every change to the card. Edits say which version they started from. */
+  version: z.number().int().min(0),
 });
 export type Card = z.infer<typeof Card>;
+
+/** Card fields that can be edited, and so can conflict. */
+export const CardField = z.enum(["title", "description"]);
+export type CardField = z.infer<typeof CardField>;
 
 // ---- field validators shared by HTTP and WebSocket requests ---------------
 
@@ -85,8 +96,9 @@ export const fields = {
   columnName: name(LIMITS.columnName),
   cardTitle: name(LIMITS.cardTitle),
   cardDescription: z.string().max(LIMITS.cardDescription),
-  /** Target index within the destination list, counted without the item being moved. */
-  index: z.number().int().min(0),
+  /** A neighbour of a dropped item, or null at the start/end of the list. */
+  anchor: z.uuid().nullable(),
+  version: z.number().int().min(0),
 };
 
 /** Byte-wise comparison, matching the server's `COLLATE "C"` ordering of positions. */

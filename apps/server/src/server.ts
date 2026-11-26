@@ -310,6 +310,7 @@ export function createAppServer(
             requestId: msg.requestId,
             code: err.code,
             message: err.message,
+            ...(err.conflictingFields ? { conflictingFields: err.conflictingFields } : {}),
           });
           return;
         }
