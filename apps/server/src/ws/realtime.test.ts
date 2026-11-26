@@ -92,9 +92,14 @@ describe("broadcasting board changes", () => {
       type: "move_card",
       cardId: card.id,
       toColumnId: doing!.id,
-      toIndex: 0,
+      afterId: null,
+      beforeId: null,
     });
-    await owner.client.request({ type: "update_card", cardId: card.id, title: "b" });
+    await owner.client.request({
+      type: "update_card",
+      cardId: card.id,
+      title: { value: "b", baseVersion: card.version },
+    });
     await owner.client.request({ type: "rename_column", columnId: todo!.id, name: "Backlog" });
     await owner.client.request({ type: "delete_card", cardId: card.id });
     await owner.client.request({ type: "delete_column", columnId: todo!.id });

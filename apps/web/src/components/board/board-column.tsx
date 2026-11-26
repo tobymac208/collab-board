@@ -4,9 +4,10 @@ import { useState } from "react";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { LIMITS, type Card, type Column } from "@collab/shared";
-import { useRequest } from "@/lib/sync";
+import { newId } from "@/lib/ids";
 import { Button, InlineEdit, Input } from "../ui";
 import { SortableCard } from "./board-card";
+import { useBoard } from "./board-context";
 
 const columnClass =
   "flex max-h-full w-72 shrink-0 flex-col rounded-lg bg-zinc-100 dark:bg-zinc-900/70";
@@ -20,7 +21,7 @@ export function BoardColumn({
   cards: Card[];
   onOpenCard: (cardId: string) => void;
 }) {
-  const request = useRequest();
+  const { mutate } = useBoard();
   const {
     setNodeRef,
     setActivatorNodeRef,
@@ -35,7 +36,7 @@ export function BoardColumn({
     const warning = cards.length
       ? `Delete “${column.name}” and its ${cards.length} card${cards.length === 1 ? "" : "s"}?`
       : `Delete “${column.name}”?`;
-    if (confirm(warning)) await request({ type: "delete_column", columnId: column.id });
+    if (confirm(warning)) await mutate({ type: "delete_column", columnId: column.id });
   }
 
   return (
@@ -59,7 +60,7 @@ export function BoardColumn({
           value={column.name}
           label="column"
           maxLength={LIMITS.columnName}
-          onSave={(name) => void request({ type: "rename_column", columnId: column.id, name })}
+          onSave={(name) => void mutate({ type: "rename_column", columnId: column.id, name })}
           className="flex-1 text-sm font-semibold"
         />
         <span className="text-xs text-zinc-500">{cards.length}</span>
@@ -99,7 +100,7 @@ export function ColumnPreview({ column, cardCount }: { column: Column; cardCount
 }
 
 function AddCard({ columnId }: { columnId: string }) {
-  const request = useRequest();
+  const { mutate } = useBoard();
   const [adding, setAdding] = useState(false);
   const [title, setTitle] = useState("");
 
@@ -119,8 +120,11 @@ function AddCard({ columnId }: { columnId: string }) {
     event.preventDefault();
     const trimmed = title.trim();
     if (!trimmed) return;
-    // Keep the form open so several cards can be added in a row.
-    if (await request({ type: "create_card", columnId, title: trimmed })) setTitle("");
+    // Keep the form open so several cards can be added in a row. The card
+    // appears right away; if the server refuses it, put the text back.
+    setTitle("");
+    const result = await mutate({ type: "create_card", columnId, title: trimmed, id: newId() });
+    if (!result.ok) setTitle(trimmed);
   }
 
   return (

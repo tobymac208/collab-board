@@ -92,6 +92,12 @@ export async function handleRequest(
       hub.close(socket, msg.boardId);
       return [];
 
+    case "focus_card":
+      // Presence only: no data changes. Ignored unless this socket has the
+      // board open, so it can't announce cards on boards it isn't viewing.
+      hub.focus(socket, msg.boardId, msg.cardId);
+      return [];
+
     case "add_member": {
       const { value, revision } = await store.addMember(db, uid, msg.boardId, msg.email);
       // The new member's board list gains the board.
@@ -109,7 +115,7 @@ export async function handleRequest(
     }
 
     case "create_column": {
-      const r = await store.createColumn(db, uid, msg.boardId, msg.name);
+      const r = await store.createColumn(db, uid, msg.boardId, msg.name, msg.id);
       return boardChange(r.boardId, {
         type: "column_upserted",
         column: r.value,
@@ -125,7 +131,7 @@ export async function handleRequest(
       });
     }
     case "move_column": {
-      const r = await store.moveColumn(db, uid, msg.columnId, msg.toIndex);
+      const r = await store.moveColumn(db, uid, msg.columnId, msg.afterId, msg.beforeId);
       return boardChange(r.boardId, {
         type: "column_upserted",
         column: r.value,
@@ -143,18 +149,25 @@ export async function handleRequest(
     }
 
     case "create_card": {
-      const r = await store.createCard(db, uid, msg.columnId, msg.title);
+      const r = await store.createCard(db, uid, msg.columnId, msg.title, msg.id);
       return boardChange(r.boardId, { type: "card_upserted", card: r.value, revision: r.revision });
     }
     case "update_card": {
       const r = await store.updateCard(db, uid, msg.cardId, {
-        title: msg.title,
-        description: msg.description,
+        ...(msg.title ? { title: msg.title } : {}),
+        ...(msg.description ? { description: msg.description } : {}),
       });
       return boardChange(r.boardId, { type: "card_upserted", card: r.value, revision: r.revision });
     }
     case "move_card": {
-      const r = await store.moveCard(db, uid, msg.cardId, msg.toColumnId, msg.toIndex);
+      const r = await store.moveCard(
+        db,
+        uid,
+        msg.cardId,
+        msg.toColumnId,
+        msg.afterId,
+        msg.beforeId,
+      );
       return boardChange(r.boardId, { type: "card_upserted", card: r.value, revision: r.revision });
     }
     case "delete_card": {

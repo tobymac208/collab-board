@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BoardChangeEvent, Card, Column, ServerEvent } from "@collab/shared";
 import {
+  boardReducer,
   findColumnOf,
   hasGap,
   initialSync,
@@ -8,6 +9,8 @@ import {
   moveCardInLayout,
   moveColumnInLayout,
   syncReducer,
+  viewOf,
+  type BoardAction,
   type BoardSync,
 } from "./board-state.ts";
 
@@ -25,6 +28,7 @@ const card = (id: string, columnId: string, position: string, title = id): Card 
   title,
   description: "",
   position,
+  version: 0,
 });
 
 const snapshotEvent = (revision = 10): ServerEvent => ({
@@ -107,7 +111,7 @@ describe("syncReducer: applying changes", () => {
   });
 
   it("tracks presence, even before the snapshot", () => {
-    const viewers = [{ userId: "u1", displayName: "Ada" }];
+    const viewers = [{ userId: "u1", displayName: "Ada", cardIds: [] }];
     expect(run([{ type: "presence", boardId: BOARD, viewers }]).viewers).toEqual(viewers);
   });
 });
@@ -154,6 +158,138 @@ describe("syncReducer: ordering", () => {
     sync = run([{ ...fresh, cards: [...fresh.cards, card("c7", "done", "a0")] }], sync);
     expect(sync.data?.revision).toBe(13);
     expect(hasGap(sync)).toBe(false);
+  });
+});
+
+describe("optimistic updates", () => {
+  const act = (actions: BoardAction[], from: BoardSync) =>
+    actions.reduce((sync, action) => boardReducer(sync, action, BOARD), from);
+  const columnOrder = (sync: BoardSync) => layoutOf(viewOf(sync)!).cardsByColumn;
+
+  it("shows our change immediately, before the server answers", () => {
+    const sync = act(
+      [
+        {
+          kind: "op_started",
+          key: 1,
+          op: { type: "create_card", columnId: "done", title: "new", id: "n1" },
+        },
+      ],
+      loaded(),
+    );
+    expect(viewOf(sync)?.cards.n1).toMatchObject({ title: "new", columnId: "done" });
+    expect(sync.data?.cards.n1).toBeUndefined(); // not confirmed yet
+  });
+
+  it("rolls back when the server rejects it", () => {
+    const sync = act(
+      [
+        { kind: "op_started", key: 1, op: { type: "delete_card", cardId: "c1" } },
+        { kind: "op_failed", key: 1 },
+      ],
+      loaded(),
+    );
+    expect(viewOf(sync)?.cards.c1).toBeDefined();
+    expect(sync.ops).toEqual([]);
+  });
+
+  it("keeps showing the change until the confirmed state includes it, without flicker", () => {
+    const op = {
+      type: "move_card",
+      cardId: "c1",
+      toColumnId: "done",
+      afterId: null,
+      beforeId: null,
+    } as const;
+    let sync = act([{ kind: "op_started", key: 1, op }], loaded());
+    // The ack can arrive while the server's event for revision 11 is still held
+    // back behind a gap: the op must stay until revision 11 is applied.
+    sync = act(
+      [
+        { kind: "event", event: upsert(12, card("x", "doing", "a5")) },
+        { kind: "op_confirmed", key: 1, revision: 11 },
+      ],
+      sync,
+    );
+    expect(viewOf(sync)?.cards.c1?.columnId).toBe("done");
+    expect(sync.ops).toHaveLength(1);
+
+    sync = act(
+      [{ kind: "event", event: upsert(11, { ...card("c1", "done", "a0"), version: 1 }) }],
+      sync,
+    );
+    expect(sync.ops).toEqual([]);
+    expect(viewOf(sync)?.cards.c1?.columnId).toBe("done");
+  });
+
+  it("replays our pending change on top of someone else's", () => {
+    // We drop c3 directly after c1 in "todo"; meanwhile someone adds c9 there.
+    let sync = act(
+      [
+        {
+          kind: "op_started",
+          key: 1,
+          op: {
+            type: "move_card",
+            cardId: "c3",
+            toColumnId: "todo",
+            afterId: "c1",
+            beforeId: "c2",
+          },
+        },
+      ],
+      loaded(),
+    );
+    expect(columnOrder(sync).todo).toEqual(["c1", "c3", "c2"]);
+    sync = act([{ kind: "event", event: upsert(11, card("c9", "todo", "a0V")) }], sync);
+    // c9 sits between c1 and c2 now; our card still goes right after c1.
+    expect(columnOrder(sync).todo).toEqual(["c1", "c3", "c9", "c2"]);
+  });
+
+  it("predicts edits and column changes", () => {
+    const sync = act(
+      [
+        {
+          kind: "op_started",
+          key: 1,
+          op: { type: "update_card", cardId: "c1", title: { value: "renamed", baseVersion: 0 } },
+        },
+        {
+          kind: "op_started",
+          key: 2,
+          op: { type: "create_column", boardId: BOARD, name: "Later", id: "later" },
+        },
+        {
+          kind: "op_started",
+          key: 3,
+          op: { type: "move_column", columnId: "later", afterId: null, beforeId: "todo" },
+        },
+        { kind: "op_started", key: 4, op: { type: "delete_column", columnId: "doing" } },
+      ],
+      loaded(),
+    );
+    const view = viewOf(sync)!;
+    expect(view.cards.c1?.title).toBe("renamed");
+    expect(view.cards.c3).toBeUndefined(); // went with its column
+    expect(layoutOf(view).columnOrder).toEqual(["later", "todo", "done"]);
+  });
+
+  it("ignores ops on things that no longer exist", () => {
+    const sync = act(
+      [
+        {
+          kind: "event",
+          event: { type: "card_deleted", boardId: BOARD, cardId: "c1", revision: 11 },
+        },
+        {
+          kind: "op_started",
+          key: 1,
+          op: { type: "update_card", cardId: "c1", title: { value: "x", baseVersion: 0 } },
+        },
+      ],
+      loaded(),
+    );
+    expect(viewOf(sync)?.cards.c1).toBeUndefined();
   });
 });
 

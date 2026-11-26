@@ -56,6 +56,11 @@ export interface CardsTable {
   description: ColumnType<string, string | undefined, string>;
   /** Fractional index key within the column, `COLLATE "C"`. */
   position: string;
+  /** Incremented by every change to the card. */
+  version: ColumnType<number, never, number>;
+  /** The card version at which each editable field last changed. */
+  title_version: ColumnType<number, never, number>;
+  description_version: ColumnType<number, never, number>;
   created_at: CreatedAt;
   updated_at: Timestamp;
 }

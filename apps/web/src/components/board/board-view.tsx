@@ -1,7 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useEffectEvent, useMemo, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import {
   DndContext,
   DragOverlay,
@@ -22,23 +30,34 @@ import {
   horizontalListSortingStrategy,
   sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
-import { LIMITS, type BoardMember, type ServerEvent, type Viewer } from "@collab/shared";
+import { LIMITS, type BoardMember, type Viewer } from "@collab/shared";
+import { useAuth } from "@/lib/auth";
 import {
+  boardReducer,
   findColumnOf,
   hasGap,
   initialSync,
   layoutOf,
   moveCardInLayout,
   moveColumnInLayout,
-  syncReducer,
+  viewOf,
+  type BoardAction,
   type BoardSync,
   type Layout,
 } from "@/lib/board-state";
+import { newId } from "@/lib/ids";
 import { RequestError } from "@/lib/sync-client";
-import { useNotify, useOnConnected, useRequest, useServerEvents, useSyncClient } from "@/lib/sync";
+import {
+  useConnectionStatus,
+  useNotify,
+  useOnConnected,
+  useServerEvents,
+  useSyncClient,
+} from "@/lib/sync";
 import { Button, InlineEdit, Input } from "../ui";
 import { BoardColumn, ColumnPreview } from "./board-column";
 import { CardPreview } from "./board-card";
+import { BoardContext, useBoard, type BoardContextValue } from "./board-context";
 import { CardDialog } from "./card-dialog";
 import { ShareDialog } from "./share-dialog";
 
@@ -66,15 +85,18 @@ const collisionDetection: CollisionDetection = (args) => {
 
 export function BoardView({ boardId }: { boardId: string }) {
   const client = useSyncClient();
-  const request = useRequest();
-
   const notify = useNotify();
+  const { state: auth } = useAuth();
+  const myUserId = auth.status === "authenticated" ? auth.user.id : null;
+  const connected = useConnectionStatus().status === "open";
 
   const [sync, dispatch] = useReducer(
-    (s: BoardSync, event: ServerEvent) => syncReducer(s, event, boardId),
+    (s: BoardSync, action: BoardAction) => boardReducer(s, action, boardId),
     initialSync,
   );
-  const { data: state, deleted, viewers } = sync;
+  /** Confirmed state with our own pending changes on top: what we show. */
+  const state = useMemo(() => viewOf(sync), [sync]);
+  const { deleted, viewers } = sync;
   const [loadError, setLoadError] = useState<string | null>(null);
   const [openCardId, setOpenCardId] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
@@ -87,7 +109,7 @@ export function BoardView({ boardId }: { boardId: string }) {
         (event.type === "column_deleted" && state.cards[openCardId]?.columnId === event.columnId);
       if (gone) notify("Someone else deleted the card you were editing.");
     }
-    dispatch(event);
+    dispatch({ kind: "event", event });
   });
 
   /** Loads the board and subscribes to its changes. */
@@ -103,6 +125,15 @@ export function BoardView({ boardId }: { boardId: string }) {
   // (Re)load the whole board every time the connection opens. After a
   // reconnect this replaces whatever we had with the server's current state.
   useOnConnected(load);
+
+  // Tell others which card we have open. On a (re)connect this runs after
+  // the load above, and the server handles a socket's requests in order.
+  useEffect(() => {
+    if (!connected) return;
+    client.request({ type: "focus_card", boardId, cardId: openCardId }).catch(() => {
+      // Presence is best-effort.
+    });
+  }, [client, boardId, openCardId, connected]);
 
   // Leaving the page: stop receiving this board's changes and presence.
   useEffect(
@@ -124,18 +155,48 @@ export function BoardView({ boardId }: { boardId: string }) {
     return () => clearTimeout(timer);
   }, [gap]);
 
+  // ---- our own changes ------------------------------------------------------
+
+  const nextOpKey = useRef(0);
+  const mutate = useCallback<BoardContextValue["mutate"]>(
+    async (op, { quiet = false } = {}) => {
+      const key = ++nextOpKey.current;
+      dispatch({ kind: "op_started", key, op }); // shows up right away
+      try {
+        const events = await client.request(op);
+        const revision = Math.max(0, ...events.map((e) => ("revision" in e ? e.revision : 0)));
+        dispatch({ kind: "op_confirmed", key, revision });
+        return { ok: true };
+      } catch (err) {
+        dispatch({ kind: "op_failed", key }); // rolls back
+        if (!quiet) notify((err as Error).message);
+        return { ok: false, error: err as RequestError };
+      }
+    },
+    [client, notify],
+  );
+
+  const boardContext = useMemo<BoardContextValue>(
+    () => ({
+      mutate,
+      othersOnCard: (cardId) =>
+        viewers.filter((v) => v.userId !== myUserId && v.cardIds.includes(cardId)),
+    }),
+    [mutate, viewers, myUserId],
+  );
+
   // ---- drag and drop ------------------------------------------------------
   //
-  // While dragging, and until the server confirms the move, we render from a
-  // local layout instead of server state, so the dropped item doesn't jump
-  // back for a moment. (Phase 3 replaces this with proper optimistic updates.)
+  // While dragging, dnd-kit needs a layout it controls (a card moves between
+  // columns as you hover), so we render from a local copy taken at the start
+  // of the drag. On drop the move becomes an optimistic op naming the
+  // neighbours the item landed between, and the local copy is discarded in
+  // the same render, so nothing jumps.
 
-  const serverLayout = useMemo(() => (state ? layoutOf(state) : null), [state]);
+  const viewLayout = useMemo(() => (state ? layoutOf(state) : null), [state]);
   const [dragLayout, setDragLayout] = useState<Layout | null>(null);
   const [active, setActive] = useState<DragItem | null>(null);
-  const draggingRef = useRef(false);
-  const pendingMovesRef = useRef(0);
-  const layout = dragLayout ?? serverLayout;
+  const layout = dragLayout ?? viewLayout;
 
   const sensors = useSensors(
     // A small distance threshold keeps plain clicks working (to open cards).
@@ -147,25 +208,16 @@ export function BoardView({ boardId }: { boardId: string }) {
     }),
   );
 
-  /** Drops the local layout once nothing is being dragged or awaiting the server. */
-  const settle = () => {
-    if (!draggingRef.current && pendingMovesRef.current === 0) setDragLayout(null);
-  };
-
-  async function sendMove(next: Layout, body: Parameters<typeof request>[0]) {
-    setDragLayout(next);
-    pendingMovesRef.current++;
-    await request(body);
-    pendingMovesRef.current--;
-    settle();
+  function endDrag() {
+    setActive(null);
+    setDragLayout(null);
   }
 
   function onDragStart({ active: item }: DragStartEvent) {
     const type = dragType(item.data);
-    if (!type || !serverLayout) return;
-    draggingRef.current = true;
+    if (!type || !viewLayout) return;
     setActive({ type, id: String(item.id) });
-    setDragLayout((current) => current ?? serverLayout);
+    setDragLayout(viewLayout);
   }
 
   // Moving a card into another column happens during the drag, so the
@@ -189,55 +241,33 @@ export function BoardView({ boardId }: { boardId: string }) {
   }
 
   function onDragEnd({ active: item, over }: DragEndEvent) {
-    draggingRef.current = false;
-    setActive(null);
     const current = dragLayout;
-    if (!over || !current || !serverLayout) {
-      settle();
-      return;
-    }
+    endDrag();
+    if (!over || !current || !viewLayout) return;
     const id = String(item.id);
     const overId = String(over.id);
 
     if (dragType(item.data) === "column") {
-      const targetColumn =
+      const target =
         dragType(over.data) === "column" ? overId : (findColumnOf(current, overId) ?? id);
-      const toIndex = current.columnOrder.indexOf(targetColumn);
-      if (toIndex === -1 || serverLayout.columnOrder.indexOf(id) === toIndex) {
-        settle();
-        return;
-      }
-      void sendMove(moveColumnInLayout(current, id, toIndex), {
-        type: "move_column",
-        columnId: id,
-        toIndex,
-      });
+      const toIndex = current.columnOrder.indexOf(target);
+      if (toIndex === -1 || viewLayout.columnOrder.indexOf(id) === toIndex) return;
+      const order = moveColumnInLayout(current, id, toIndex).columnOrder;
+      void mutate({ type: "move_column", columnId: id, ...neighbours(order, id) });
       return;
     }
 
     const column = findColumnOf(current, id);
-    if (!column) {
-      settle();
-      return;
-    }
+    if (!column) return;
     const cards = current.cardsByColumn[column]!;
     const overIndex = cards.indexOf(overId);
     const toIndex = overIndex === -1 ? cards.indexOf(id) : overIndex;
-    const next = moveCardInLayout(current, id, column, toIndex);
     const unchanged =
-      findColumnOf(serverLayout, id) === column &&
-      serverLayout.cardsByColumn[column]?.indexOf(id) === toIndex;
-    if (unchanged) {
-      settle();
-      return;
-    }
-    void sendMove(next, { type: "move_card", cardId: id, toColumnId: column, toIndex });
-  }
-
-  function onDragCancel() {
-    draggingRef.current = false;
-    setActive(null);
-    settle();
+      findColumnOf(viewLayout, id) === column &&
+      viewLayout.cardsByColumn[column]?.indexOf(id) === toIndex;
+    if (unchanged) return;
+    const list = moveCardInLayout(current, id, column, toIndex).cardsByColumn[column]!;
+    void mutate({ type: "move_card", cardId: id, toColumnId: column, ...neighbours(list, id) });
   }
 
   // Screen reader announcements that use names instead of ids.
@@ -278,76 +308,84 @@ export function BoardView({ boardId }: { boardId: string }) {
   const openCard = openCardId ? state.cards[openCardId] : undefined;
 
   return (
-    <main className="flex min-h-0 flex-1 flex-col">
-      <div className="flex flex-wrap items-center gap-3 px-6 pt-5">
-        <InlineEdit
-          value={state.board.name}
-          label="board"
-          maxLength={LIMITS.boardName}
-          disabled={!isOwner}
-          onSave={(name) => void request({ type: "rename_board", boardId, name })}
-          className="text-xl font-semibold tracking-tight"
+    <BoardContext value={boardContext}>
+      <main className="flex min-h-0 flex-1 flex-col">
+        <div className="flex flex-wrap items-center gap-3 px-6 pt-5">
+          <InlineEdit
+            value={state.board.name}
+            label="board"
+            maxLength={LIMITS.boardName}
+            disabled={!isOwner}
+            onSave={(name) => void mutate({ type: "rename_board", boardId, name })}
+            className="text-xl font-semibold tracking-tight"
+          />
+          <div className="ml-auto flex items-center gap-3">
+            <Presence members={state.members} viewers={viewers} />
+            <Button variant="secondary" onClick={() => setSharing(true)}>
+              {isOwner ? "Share" : "Members"}
+            </Button>
+          </div>
+        </div>
+
+        <DndContext
+          sensors={sensors}
+          collisionDetection={collisionDetection}
+          accessibility={{ announcements }}
+          onDragStart={onDragStart}
+          onDragOver={onDragOver}
+          onDragEnd={onDragEnd}
+          onDragCancel={endDrag}
+        >
+          <div className="flex min-h-0 flex-1 items-start gap-4 overflow-x-auto p-6">
+            <SortableContext items={layout.columnOrder} strategy={horizontalListSortingStrategy}>
+              {layout.columnOrder.map((columnId) => {
+                const column = state.columns[columnId];
+                if (!column) return null;
+                const cards = (layout.cardsByColumn[columnId] ?? [])
+                  .map((id) => state.cards[id])
+                  .filter((c) => c !== undefined);
+                return (
+                  <BoardColumn
+                    key={columnId}
+                    column={column}
+                    cards={cards}
+                    onOpenCard={setOpenCardId}
+                  />
+                );
+              })}
+            </SortableContext>
+            <AddColumn boardId={boardId} />
+          </div>
+
+          <DragOverlay>
+            {active?.type === "card" && state.cards[active.id] ? (
+              <CardPreview card={state.cards[active.id]!} />
+            ) : active?.type === "column" && state.columns[active.id] ? (
+              <ColumnPreview
+                column={state.columns[active.id]!}
+                cardCount={layout.cardsByColumn[active.id]?.length ?? 0}
+              />
+            ) : null}
+          </DragOverlay>
+        </DndContext>
+
+        <CardDialog card={openCard} onClose={() => setOpenCardId(null)} />
+        <ShareDialog
+          open={sharing}
+          onClose={() => setSharing(false)}
+          boardId={boardId}
+          members={state.members}
+          isOwner={isOwner}
         />
-        <div className="ml-auto flex items-center gap-3">
-          <Presence members={state.members} viewers={viewers} />
-          <Button variant="secondary" onClick={() => setSharing(true)}>
-            {isOwner ? "Share" : "Members"}
-          </Button>
-        </div>
-      </div>
-
-      <DndContext
-        sensors={sensors}
-        collisionDetection={collisionDetection}
-        accessibility={{ announcements }}
-        onDragStart={onDragStart}
-        onDragOver={onDragOver}
-        onDragEnd={onDragEnd}
-        onDragCancel={onDragCancel}
-      >
-        <div className="flex min-h-0 flex-1 items-start gap-4 overflow-x-auto p-6">
-          <SortableContext items={layout.columnOrder} strategy={horizontalListSortingStrategy}>
-            {layout.columnOrder.map((columnId) => {
-              const column = state.columns[columnId];
-              if (!column) return null;
-              const cards = (layout.cardsByColumn[columnId] ?? [])
-                .map((id) => state.cards[id])
-                .filter((c) => c !== undefined);
-              return (
-                <BoardColumn
-                  key={columnId}
-                  column={column}
-                  cards={cards}
-                  onOpenCard={setOpenCardId}
-                />
-              );
-            })}
-          </SortableContext>
-          <AddColumn boardId={boardId} />
-        </div>
-
-        <DragOverlay>
-          {active?.type === "card" && state.cards[active.id] ? (
-            <CardPreview card={state.cards[active.id]!} />
-          ) : active?.type === "column" && state.columns[active.id] ? (
-            <ColumnPreview
-              column={state.columns[active.id]!}
-              cardCount={layout.cardsByColumn[active.id]?.length ?? 0}
-            />
-          ) : null}
-        </DragOverlay>
-      </DndContext>
-
-      <CardDialog card={openCard} onClose={() => setOpenCardId(null)} />
-      <ShareDialog
-        open={sharing}
-        onClose={() => setSharing(false)}
-        boardId={boardId}
-        members={state.members}
-        isOwner={isOwner}
-      />
-    </main>
+      </main>
+    </BoardContext>
   );
+}
+
+/** The items directly before and after `id` in an ordered list. */
+function neighbours(list: string[], id: string) {
+  const i = list.indexOf(id);
+  return { afterId: list[i - 1] ?? null, beforeId: list[i + 1] ?? null };
 }
 
 /**
@@ -390,14 +428,16 @@ function Presence({ members, viewers }: { members: BoardMember[]; viewers: Viewe
 }
 
 function AddColumn({ boardId }: { boardId: string }) {
-  const request = useRequest();
+  const { mutate } = useBoard();
   const [name, setName] = useState("");
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     const trimmed = name.trim();
     if (!trimmed) return;
-    if (await request({ type: "create_column", boardId, name: trimmed })) setName("");
+    setName(""); // the column appears right away
+    const result = await mutate({ type: "create_column", boardId, name: trimmed, id: newId() });
+    if (!result.ok) setName(trimmed); // let them retry
   }
 
   return (
