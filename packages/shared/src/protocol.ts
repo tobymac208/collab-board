@@ -39,12 +39,18 @@ import {
  * item was dropped between rather than an index, so the server can honour
  * the user's intent even if the list changed meanwhile.
  *
+ * Resilience: board changes carry an `opId` so a change resent after a
+ * dropped connection is applied only once, and a reconnecting client can ask
+ * `open_board` for just the changes since the revision it has. The server
+ * replies with those changes as ordinary events, or with a full snapshot if
+ * it no longer has them all.
+ *
  * Conflicts: card edits say which card version each field was based on. If
  * someone else changed that field since, the edit is rejected with a
  * `conflict` error listing the fields; edits to different fields merge.
  */
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 // ---- client -> server ----------------------------------------------------
 
@@ -52,6 +58,14 @@ const requestId = z.string().min(1).max(64);
 
 const request = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) =>
   z.object({ type: z.literal(type), requestId, ...shape });
+
+/**
+ * A request that changes a board. `opId` identifies the change itself, not
+ * one attempt to send it: a client that resends a change after losing its
+ * connection uses the same `opId`, and the server applies it at most once.
+ */
+const op = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) =>
+  request(type, { opId: fields.id, ...shape });
 
 export const ClientMessage = z.discriminatedUnion("type", [
   z.object({
@@ -62,10 +76,14 @@ export const ClientMessage = z.discriminatedUnion("type", [
 
   request("list_boards", {}),
   request("create_board", { name: fields.boardName }),
-  request("rename_board", { boardId: fields.id, name: fields.boardName }),
+  op("rename_board", { boardId: fields.id, name: fields.boardName }),
   request("delete_board", { boardId: fields.id }),
   /** Loads a board and subscribes to its changes and presence. */
-  request("open_board", { boardId: fields.id }),
+  request("open_board", {
+    boardId: fields.id,
+    /** The revision the client already has. If set, the server may reply with only newer changes. */
+    sinceRevision: fields.version.optional(),
+  }),
   /** Stops receiving a board's changes (e.g. on navigating away). */
   request("close_board", { boardId: fields.id }),
   request("add_member", { boardId: fields.id, email: fields.email }),
@@ -73,23 +91,23 @@ export const ClientMessage = z.discriminatedUnion("type", [
   /** Says which card this socket has open (null when none), for card presence. */
   request("focus_card", { boardId: fields.id, cardId: fields.id.nullable() }),
 
-  request("create_column", {
+  op("create_column", {
     boardId: fields.id,
     name: fields.columnName,
     /** Client-generated, so the column can be shown before the server replies. */
     id: fields.id.optional(),
   }),
-  request("rename_column", { columnId: fields.id, name: fields.columnName }),
-  request("move_column", { columnId: fields.id, afterId: fields.anchor, beforeId: fields.anchor }),
-  request("delete_column", { columnId: fields.id }),
+  op("rename_column", { columnId: fields.id, name: fields.columnName }),
+  op("move_column", { columnId: fields.id, afterId: fields.anchor, beforeId: fields.anchor }),
+  op("delete_column", { columnId: fields.id }),
 
-  request("create_card", {
+  op("create_card", {
     columnId: fields.id,
     title: fields.cardTitle,
     /** Client-generated, so the card can be shown before the server replies. */
     id: fields.id.optional(),
   }),
-  request("update_card", {
+  op("update_card", {
     cardId: fields.id,
     /** Each changed field, with the card version the edit to it started from. */
     title: z.object({ value: fields.cardTitle, baseVersion: fields.version }).optional(),
@@ -97,13 +115,13 @@ export const ClientMessage = z.discriminatedUnion("type", [
       .object({ value: fields.cardDescription, baseVersion: fields.version })
       .optional(),
   }),
-  request("move_card", {
+  op("move_card", {
     cardId: fields.id,
     toColumnId: fields.id,
     afterId: fields.anchor,
     beforeId: fields.anchor,
   }),
-  request("delete_card", { cardId: fields.id }),
+  op("delete_card", { cardId: fields.id }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 export type ClientRequest = Exclude<ClientMessage, { type: "ping" }>;

@@ -1,5 +1,5 @@
 import type { WebSocket } from "ws";
-import type { BoardChangeEvent, ClientRequest, ServerEvent, User } from "@collab/shared";
+import type { ClientRequest, ServerEvent, User } from "@collab/shared";
 import type { DB } from "../db/schema.ts";
 import * as store from "../boards/store.ts";
 import type { Hub } from "./hub.ts";
@@ -23,10 +23,14 @@ export async function handleRequest(
   const { db, hub, socket } = ctx;
   const uid = ctx.user.id;
 
-  /** A board change: everyone else viewing the board gets it too. */
-  const boardChange = (boardId: string, event: BoardChangeEvent): ServerEvent[] => {
-    hub.toBoard(boardId, event, socket);
-    return [event];
+  /**
+   * Replies with a board write's event and, unless this was a resend of a
+   * change already applied (and already broadcast), tells everyone else
+   * viewing the board.
+   */
+  const boardChange = (write: store.BoardWrite<unknown>): ServerEvent[] => {
+    if (!write.replayed) hub.toBoard(write.boardId, write.event, socket);
+    return [write.event];
   };
 
   switch (msg.type) {
@@ -34,34 +38,34 @@ export async function handleRequest(
       return [{ type: "board_list", boards: await store.listBoards(db, uid) }];
 
     case "create_board": {
-      const { value: board, revision } = await store.createBoard(db, uid, msg.name);
+      const { board, revision } = await store.createBoard(db, uid, msg.name);
       const event: ServerEvent = { type: "board_upserted", board, revision };
       hub.toUser(uid, event, socket); // the creator's other tabs
       return [event];
     }
 
     case "rename_board": {
-      const { value, revision } = await store.renameBoard(db, uid, msg.boardId, msg.name);
-      const { name } = value;
-      // Board lists and open boards alike; each member sees their own role.
-      for (const member of value.members) {
-        hub.toUser(
-          member.userId,
-          {
-            type: "board_upserted",
-            board: { id: msg.boardId, name, role: member.role },
-            revision,
-          },
-          socket,
-        );
+      const write = await store.renameBoard(
+        db,
+        { userId: uid, opId: msg.opId },
+        msg.boardId,
+        msg.name,
+      );
+      if (!write.replayed) {
+        // Board lists and open boards alike; each member sees their own role.
+        for (const member of write.value.members) {
+          hub.toUser(
+            member.userId,
+            {
+              type: "board_upserted",
+              board: { id: msg.boardId, name: msg.name, role: member.role },
+              revision: write.revision,
+            },
+            socket,
+          );
+        }
       }
-      return [
-        {
-          type: "board_upserted",
-          board: { id: msg.boardId, name, role: "owner" }, // only owners can rename
-          revision,
-        },
-      ];
+      return [write.event]; // the owner's own view; only owners can rename
     }
 
     case "delete_board": {
@@ -74,12 +78,18 @@ export async function handleRequest(
 
     case "open_board": {
       // Check access, then subscribe, then read. Subscribing before the read
-      // means no change can slip between the snapshot and the subscription;
-      // any change that lands in that window arrives as an event the client
-      // can recognise as already included by its revision.
+      // means no change can slip between the reply and the subscription; a
+      // change that lands in that window arrives as an event the client
+      // recognises as already included by its revision.
       await store.requireAccess(db, uid, msg.boardId);
       hub.open(socket, msg.boardId);
       try {
+        // A client that already has the board at some revision gets just the
+        // changes since, if the log still has them all.
+        if (msg.sinceRevision !== undefined) {
+          const changes = await store.getChangesSince(db, uid, msg.boardId, msg.sinceRevision);
+          if (changes) return changes;
+        }
         const snapshot = await store.getBoardSnapshot(db, uid, msg.boardId);
         return [{ type: "board_snapshot", ...snapshot }];
       } catch (err) {
@@ -99,85 +109,54 @@ export async function handleRequest(
       return [];
 
     case "add_member": {
-      const { value, revision } = await store.addMember(db, uid, msg.boardId, msg.email);
-      // The new member's board list gains the board.
-      hub.toUser(value.member.userId, {
-        type: "board_upserted",
-        board: { id: msg.boardId, name: value.boardName, role: value.member.role },
-        revision,
-      });
-      return boardChange(msg.boardId, {
-        type: "member_added",
-        boardId: msg.boardId,
-        member: value.member,
-        revision,
-      });
+      const write = await store.addMember(db, { userId: uid }, msg.boardId, msg.email);
+      if (!write.replayed) {
+        // The new member's board list gains the board.
+        hub.toUser(write.value.member.userId, {
+          type: "board_upserted",
+          board: { id: msg.boardId, name: write.value.boardName, role: write.value.member.role },
+          revision: write.revision,
+        });
+      }
+      return boardChange(write);
     }
 
-    case "create_column": {
-      const r = await store.createColumn(db, uid, msg.boardId, msg.name, msg.id);
-      return boardChange(r.boardId, {
-        type: "column_upserted",
-        column: r.value,
-        revision: r.revision,
-      });
-    }
-    case "rename_column": {
-      const r = await store.renameColumn(db, uid, msg.columnId, msg.name);
-      return boardChange(r.boardId, {
-        type: "column_upserted",
-        column: r.value,
-        revision: r.revision,
-      });
-    }
-    case "move_column": {
-      const r = await store.moveColumn(db, uid, msg.columnId, msg.afterId, msg.beforeId);
-      return boardChange(r.boardId, {
-        type: "column_upserted",
-        column: r.value,
-        revision: r.revision,
-      });
-    }
-    case "delete_column": {
-      const r = await store.deleteColumn(db, uid, msg.columnId);
-      return boardChange(r.boardId, {
-        type: "column_deleted",
-        boardId: r.boardId,
-        columnId: r.value.id,
-        revision: r.revision,
-      });
-    }
-
-    case "create_card": {
-      const r = await store.createCard(db, uid, msg.columnId, msg.title, msg.id);
-      return boardChange(r.boardId, { type: "card_upserted", card: r.value, revision: r.revision });
-    }
-    case "update_card": {
-      const r = await store.updateCard(db, uid, msg.cardId, {
-        ...(msg.title ? { title: msg.title } : {}),
-        ...(msg.description ? { description: msg.description } : {}),
-      });
-      return boardChange(r.boardId, { type: "card_upserted", card: r.value, revision: r.revision });
-    }
-    case "move_card": {
-      const r = await store.moveCard(
-        db,
-        uid,
-        msg.cardId,
-        msg.toColumnId,
-        msg.afterId,
-        msg.beforeId,
+    case "create_column":
+      return boardChange(await store.createColumn(db, actorOf(msg), msg.boardId, msg.name, msg.id));
+    case "rename_column":
+      return boardChange(await store.renameColumn(db, actorOf(msg), msg.columnId, msg.name));
+    case "move_column":
+      return boardChange(
+        await store.moveColumn(db, actorOf(msg), msg.columnId, msg.afterId, msg.beforeId),
       );
-      return boardChange(r.boardId, { type: "card_upserted", card: r.value, revision: r.revision });
-    }
-    case "delete_card": {
-      const r = await store.deleteCard(db, uid, msg.cardId);
-      return boardChange(r.boardId, {
-        type: "card_deleted",
-        boardId: r.boardId,
-        cardId: r.value.id,
-        revision: r.revision,
-      });
-    }
+    case "delete_column":
+      return boardChange(await store.deleteColumn(db, actorOf(msg), msg.columnId));
+
+    case "create_card":
+      return boardChange(await store.createCard(db, actorOf(msg), msg.columnId, msg.title, msg.id));
+    case "update_card":
+      return boardChange(
+        await store.updateCard(db, actorOf(msg), msg.cardId, {
+          ...(msg.title ? { title: msg.title } : {}),
+          ...(msg.description ? { description: msg.description } : {}),
+        }),
+      );
+    case "move_card":
+      return boardChange(
+        await store.moveCard(
+          db,
+          actorOf(msg),
+          msg.cardId,
+          msg.toColumnId,
+          msg.afterId,
+          msg.beforeId,
+        ),
+      );
+    case "delete_card":
+      return boardChange(await store.deleteCard(db, actorOf(msg), msg.cardId));
+  }
+
+  function actorOf(op: { opId: string }): store.Actor {
+    return { userId: uid, opId: op.opId };
   }
 }

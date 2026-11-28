@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { useAuth } from "@/lib/auth";
+import { countUnsent } from "@/lib/offline-store";
 import { SyncProvider } from "@/lib/sync";
 import { ConnectionStatus } from "./connection-status";
 import { Button } from "./ui";
@@ -12,6 +13,21 @@ import { Button } from "./ui";
 export function AppShell({ children }: { children: React.ReactNode }) {
   const { state, logout, refresh } = useAuth();
   const router = useRouter();
+
+  /** Logging out discards unsent offline changes, so say so first. */
+  async function confirmLogout(userId: string) {
+    const unsent = countUnsent(userId);
+    if (
+      unsent > 0 &&
+      !confirm(
+        `You have ${unsent} change${unsent === 1 ? "" : "s"} that haven't reached the server yet. ` +
+          "Logging out will discard them. Log out anyway?",
+      )
+    ) {
+      return;
+    }
+    await logout();
+  }
 
   useEffect(() => {
     if (state.status === "anonymous") router.replace("/login");
@@ -45,7 +61,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         {user && (
           <div className="ml-auto flex items-center gap-3 text-sm">
             <span className="text-zinc-600 dark:text-zinc-400">{user.displayName}</span>
-            <Button variant="ghost" onClick={() => void logout()}>
+            <Button variant="ghost" onClick={() => void confirmLogout(user.id)}>
               Log out
             </Button>
           </div>

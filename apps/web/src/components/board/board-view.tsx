@@ -40,12 +40,17 @@ import {
   layoutOf,
   moveCardInLayout,
   moveColumnInLayout,
+  unsentOps,
   viewOf,
   type BoardAction,
+  type BoardOp,
   type BoardSync,
   type Layout,
+  type LocalOp,
+  type RejectedOp,
 } from "@/lib/board-state";
 import { newId } from "@/lib/ids";
+import { forgetBoard, restoreBoard, saveBoard } from "@/lib/offline-store";
 import { RequestError } from "@/lib/sync-client";
 import {
   useConnectionStatus,
@@ -57,8 +62,14 @@ import {
 import { Button, InlineEdit, Input } from "../ui";
 import { BoardColumn, ColumnPreview } from "./board-column";
 import { CardPreview } from "./board-card";
-import { BoardContext, useBoard, type BoardContextValue } from "./board-context";
-import { CardDialog } from "./card-dialog";
+import {
+  BoardContext,
+  useBoard,
+  type BoardContextValue,
+  type MutationResult,
+} from "./board-context";
+import { CardDialog, type CardResume } from "./card-dialog";
+import { ReviewPanel } from "./review-panel";
 import { ShareDialog } from "./share-dialog";
 
 /** How long to wait for a missing revision before reloading the board. */
@@ -98,8 +109,19 @@ export function BoardView({ boardId }: { boardId: string }) {
   const state = useMemo(() => viewOf(sync), [sync]);
   const { deleted, viewers } = sync;
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [openCardId, setOpenCardId] = useState<string | null>(null);
+  const [openCard, setOpenCard] = useState<{
+    id: string;
+    /** Reopening a refused offline edit: its text, and which rejection it came from. */
+    resume?: CardResume;
+    rejectedOpId?: string;
+  } | null>(null);
+  const openCardId = openCard?.id ?? null;
+  const setOpenCardId = useCallback((id: string | null) => setOpenCard(id ? { id } : null), []);
   const [sharing, setSharing] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  /** The board has been loaded or caught up on the current connection. */
+  const [loaded, setLoaded] = useState(false);
+  const live = connected && loaded;
 
   useServerEvents((event) => {
     // Someone else deleting the card you're editing closes the editor; say why.
@@ -112,18 +134,73 @@ export function BoardView({ boardId }: { boardId: string }) {
     dispatch({ kind: "event", event });
   });
 
-  /** Loads the board and subscribes to its changes. */
+  // ---- saved in the browser -------------------------------------------------
+  //
+  // Restored in an effect rather than during render, so the server-rendered
+  // page and the first browser render agree; the board appears a moment later.
+
+  /** The revision of the saved copy we restored, for catching up from it. */
+  const restoredRevision = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (!myUserId) return;
+    // Not cancelled on cleanup: restoring also adopts (and removes) queues of
+    // closed tabs, and dropping that result would lose them. Restoring twice
+    // is harmless; the reducer merges by opId.
+    void restoreBoard(myUserId, boardId).then((saved) => {
+      if (!saved) return;
+      restoredRevision.current = saved.data?.revision;
+      dispatch({ kind: "restored", ...saved });
+    });
+  }, [myUserId, boardId]);
+
+  /** False when the browser refused to save (storage full or blocked). */
+  const [saveFailed, setSaveFailed] = useState(false);
+  useEffect(() => {
+    if (!myUserId || !sync.data) return;
+    void saveBoard(myUserId, boardId, {
+      data: sync.data,
+      ops: sync.ops,
+      rejected: sync.rejected,
+    }).then((ok) => setSaveFailed(!ok));
+  }, [myUserId, boardId, sync.data, sync.ops, sync.rejected]);
+
+  useEffect(() => {
+    if (deleted && myUserId) forgetBoard(myUserId, boardId);
+  }, [deleted, myUserId, boardId]);
+
+  // ---- loading and catching up --------------------------------------------
+
+  /**
+   * Loads the board and subscribes to its changes. If we already have it at
+   * some revision (from this visit or a saved copy), asks only for the
+   * changes since, which the server sends as ordinary events.
+   */
   const load = () => {
-    client.request({ type: "open_board", boardId }).then(
-      () => setLoadError(null),
-      (err: RequestError) => {
-        if (err.code !== "disconnected") setLoadError(err.message);
-      },
-    );
+    setLoaded(false);
+    // Catch up from what we actually have: the board as shown, or the saved
+    // copy we restored. (Not a fresh read of storage, which another tab may
+    // have moved on since.)
+    const since = sync.data?.revision ?? restoredRevision.current;
+    client
+      .request({
+        type: "open_board",
+        boardId,
+        ...(since === undefined ? {} : { sinceRevision: since }),
+      })
+      .then(
+        () => {
+          setLoadError(null);
+          setLoaded(true);
+        },
+        (err: RequestError) => {
+          if (err.code === "disconnected") return;
+          if (err.code === "not_found" && myUserId) forgetBoard(myUserId, boardId);
+          setLoadError(err.message);
+        },
+      );
   };
 
-  // (Re)load the whole board every time the connection opens. After a
-  // reconnect this replaces whatever we had with the server's current state.
+  // Every time the connection opens: catch up, then (below) send what's queued.
   useOnConnected(load);
 
   // Tell others which card we have open. On a (re)connect this runs after
@@ -146,7 +223,7 @@ export function BoardView({ boardId }: { boardId: string }) {
   );
 
   // A change arrived ahead of one we never got. Give it a moment to show up,
-  // then reload the board rather than stay out of date.
+  // then catch up rather than stay out of date.
   const gap = hasGap(sync);
   const reload = useEffectEvent(load);
   useEffect(() => {
@@ -156,24 +233,78 @@ export function BoardView({ boardId }: { boardId: string }) {
   }, [gap]);
 
   // ---- our own changes ------------------------------------------------------
+  //
+  // Every change goes into `sync.ops` first and shows immediately. While the
+  // board is live, the effect below sends unsent ops in order. Offline, they
+  // wait; on reconnect (after catching up) they're sent then. Each op keeps
+  // its opId across attempts, so a resend after a dropped connection is
+  // applied once.
 
-  const nextOpKey = useRef(0);
-  const mutate = useCallback<BoardContextValue["mutate"]>(
-    async (op, { quiet = false } = {}) => {
-      const key = ++nextOpKey.current;
-      dispatch({ kind: "op_started", key, op }); // shows up right away
-      try {
-        const events = await client.request(op);
+  /** Ops sent on the current connection, so each goes out once per connection. */
+  const sent = useRef(new Set<string>());
+  /** Callers waiting to hear how their change went (e.g. the card editor). */
+  const waiting = useRef(
+    new Map<string, { resolve: (result: MutationResult) => void; quiet: boolean }>(),
+  );
+
+  useEffect(() => {
+    if (!connected) sent.current.clear(); // resend everything unconfirmed next time
+  }, [connected]);
+
+  const settle = (opId: string, result: MutationResult) => {
+    waiting.current.get(opId)?.resolve(result);
+    waiting.current.delete(opId);
+  };
+
+  const send = useEffectEvent((local: LocalOp) => {
+    const { opId } = local.op;
+    client.request(local.op).then(
+      (events) => {
         const revision = Math.max(0, ...events.map((e) => ("revision" in e ? e.revision : 0)));
-        dispatch({ kind: "op_confirmed", key, revision });
-        return { ok: true };
-      } catch (err) {
-        dispatch({ kind: "op_failed", key }); // rolls back
-        if (!quiet) notify((err as Error).message);
-        return { ok: false, error: err as RequestError };
-      }
+        dispatch({ kind: "op_confirmed", opId, revision });
+        settle(opId, { ok: true });
+      },
+      (err: RequestError) => {
+        if (err.code === "disconnected") {
+          // Unknown whether it arrived: resend after reconnecting, same opId.
+          sent.current.delete(opId);
+          dispatch({ kind: "op_deferred", opId });
+          settle(opId, { ok: true, queued: true });
+          return;
+        }
+        if (local.deferred) {
+          const error = {
+            code: err.code,
+            message: err.message,
+            conflictingFields: err.conflictingFields,
+          };
+          dispatch({ kind: "op_rejected", opId, error });
+        } else {
+          dispatch({ kind: "op_failed", opId }); // rolls back
+          if (!waiting.current.get(opId)?.quiet) notify(err.message);
+        }
+        settle(opId, { ok: false, error: err });
+      },
+    );
+  });
+
+  useEffect(() => {
+    if (!live) return;
+    for (const local of sync.ops) {
+      if (local.confirmedAt !== undefined || sent.current.has(local.op.opId)) continue;
+      sent.current.add(local.op.opId);
+      send(local);
+    }
+  }, [live, sync.ops]);
+
+  const mutate = useCallback<BoardContextValue["mutate"]>(
+    (input, { quiet = false } = {}) => {
+      const op = { ...input, opId: newId() } as BoardOp;
+      dispatch({ kind: "op_started", op, deferred: !live }); // shows up right away
+      if (!live) return Promise.resolve({ ok: true, queued: true });
+      return new Promise((resolve) => waiting.current.set(op.opId, { resolve, quiet }));
     },
-    [client, notify],
+    [live],
   );
 
   const boardContext = useMemo<BoardContextValue>(
@@ -184,6 +315,27 @@ export function BoardView({ boardId }: { boardId: string }) {
     }),
     [mutate, viewers, myUserId],
   );
+
+  const unsent = unsentOps(sync).length;
+
+  /**
+   * Reopens a refused offline card edit in the editor, with the clash shown.
+   * The rejection stays (and stays saved) until the new edit is saved or
+   * queued, so cancelling the editor doesn't lose the text.
+   */
+  function resolve(rejected: RejectedOp) {
+    if (rejected.op.type !== "update_card") return;
+    const { title, description } = rejected.op;
+    setReviewing(false);
+    setOpenCard({
+      id: rejected.op.cardId,
+      rejectedOpId: rejected.op.opId,
+      resume: {
+        drafts: { ...(title ? { title } : {}), ...(description ? { description } : {}) },
+        conflicts: rejected.conflictingFields,
+      },
+    });
+  }
 
   // ---- drag and drop ------------------------------------------------------
   //
@@ -305,7 +457,6 @@ export function BoardView({ boardId }: { boardId: string }) {
   }
 
   const isOwner = state.board.role === "owner";
-  const openCard = openCardId ? state.cards[openCardId] : undefined;
 
   return (
     <BoardContext value={boardContext}>
@@ -320,12 +471,43 @@ export function BoardView({ boardId }: { boardId: string }) {
             className="text-xl font-semibold tracking-tight"
           />
           <div className="ml-auto flex items-center gap-3">
+            {unsent > 0 && (
+              <span className="text-xs text-zinc-500" role="status">
+                {live
+                  ? `Syncing ${unsent} change${unsent === 1 ? "" : "s"}…`
+                  : `${unsent} unsent change${unsent === 1 ? "" : "s"} · will sync when you're back online`}
+              </span>
+            )}
             <Presence members={state.members} viewers={viewers} />
             <Button variant="secondary" onClick={() => setSharing(true)}>
               {isOwner ? "Share" : "Members"}
             </Button>
           </div>
         </div>
+
+        {saveFailed && unsent > 0 && (
+          <div
+            role="alert"
+            className="mx-6 mt-3 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200"
+          >
+            Your unsent changes couldn&apos;t be saved in this browser (storage is full or blocked).
+            Keep this tab open until they&apos;ve synced, or they&apos;ll be lost.
+          </div>
+        )}
+
+        {sync.rejected.length > 0 && (
+          <div
+            role="alert"
+            className="mx-6 mt-3 flex items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+          >
+            {sync.rejected.length === 1
+              ? "1 change you made offline couldn't be applied."
+              : `${sync.rejected.length} changes you made offline couldn't be applied.`}
+            <Button variant="secondary" className="ml-auto" onClick={() => setReviewing(true)}>
+              Review
+            </Button>
+          </div>
+        )}
 
         <DndContext
           sensors={sensors}
@@ -369,7 +551,23 @@ export function BoardView({ boardId }: { boardId: string }) {
           </DragOverlay>
         </DndContext>
 
-        <CardDialog card={openCard} onClose={() => setOpenCardId(null)} />
+        <CardDialog
+          card={openCardId ? state.cards[openCardId] : undefined}
+          resume={openCard?.resume}
+          onSaved={() => {
+            const opId = openCard?.rejectedOpId;
+            if (opId) dispatch({ kind: "rejected_dismissed", opId });
+          }}
+          onClose={() => setOpenCardId(null)}
+        />
+        <ReviewPanel
+          open={reviewing}
+          onClose={() => setReviewing(false)}
+          rejected={sync.rejected}
+          board={state}
+          onDismiss={(opId) => dispatch({ kind: "rejected_dismissed", opId })}
+          onResolve={resolve}
+        />
         <ShareDialog
           open={sharing}
           onClose={() => setSharing(false)}

@@ -1,4 +1,5 @@
 import {
+  PROTOCOL_VERSION,
   parseServerMessage,
   type CardField,
   type ClientMessage,
@@ -12,7 +13,9 @@ export type ConnectionStatus =
   | { status: "open"; rttMs: number | null }
   | { status: "closed"; retryInMs: number }
   /** The session ended (logout elsewhere, expiry). No reconnects. */
-  | { status: "ended" };
+  | { status: "ended" }
+  /** The server speaks a newer protocol: this page must be reloaded. No reconnects. */
+  | { status: "outdated" };
 
 export class RequestError extends Error {
   constructor(
@@ -26,9 +29,18 @@ export class RequestError extends Error {
 }
 
 const PING_INTERVAL_MS = 5_000;
+/**
+ * If nothing at all arrives for this long (two missed pongs and then some),
+ * the connection is treated as dead. Networks can fail without closing the
+ * socket (Wi-Fi drops, a laptop sleeping); the browser may not notice for
+ * minutes, and changes sent meanwhile would wait forever.
+ */
+export const HEARTBEAT_TIMEOUT_MS = 12_000;
 const MAX_BACKOFF_MS = 10_000;
 /** Must match the server's CLOSE_SESSION_ENDED. */
 const CLOSE_SESSION_ENDED = 4001;
+/** Our own code for a connection we gave up on (never sent over the wire). */
+const CLOSE_HEARTBEAT_TIMEOUT = 4900;
 
 /** Exponential backoff with full jitter, so many clients don't reconnect in lockstep. */
 export function backoffDelay(attempt: number): number {
@@ -138,8 +150,10 @@ export class SyncClient {
     const socket = new WebSocket(this.url);
     this.#socket = socket;
     let welcomed = false;
+    let lastHeard = Date.now();
 
     socket.onmessage = (event) => {
+      lastHeard = Date.now();
       const parsed = parseServerMessage(String(event.data));
       if (!parsed.ok) {
         console.warn("ignoring malformed server message:", parsed.error);
@@ -148,14 +162,32 @@ export class SyncClient {
       const msg = parsed.value;
       switch (msg.type) {
         case "welcome":
+          if (msg.protocolVersion !== PROTOCOL_VERSION) {
+            // A new version was deployed. Talking to it with old code would
+            // fail in confusing ways; stop and ask for a reload instead.
+            // Unsent changes stay queued (and saved) for after the reload.
+            this.#stopped = true;
+            socket.close();
+            this.#failPending();
+            this.#setStatus({ status: "outdated" });
+            return;
+          }
           welcomed = true;
           this.#attempt = 0;
           this.#setStatus({ status: "open", rttMs: null });
           this.#send({ type: "ping", sentAt: Date.now() });
-          this.#pingTimer = setInterval(
-            () => this.#send({ type: "ping", sentAt: Date.now() }),
-            PING_INTERVAL_MS,
-          );
+          this.#pingTimer = setInterval(() => {
+            if (Date.now() - lastHeard > HEARTBEAT_TIMEOUT_MS) {
+              // Don't wait for a close handshake over a dead network: stop
+              // listening to this socket and handle it as closed right now.
+              socket.onclose = null;
+              socket.onmessage = null;
+              socket.close();
+              void onClosed(CLOSE_HEARTBEAT_TIMEOUT);
+              return;
+            }
+            this.#send({ type: "ping", sentAt: Date.now() });
+          }, PING_INTERVAL_MS);
           break;
         case "pong":
           if (this.#status.status === "open") {
@@ -184,11 +216,11 @@ export class SyncClient {
       }
     };
 
-    socket.onclose = async (event) => {
+    const onClosed = async (code: number) => {
       clearInterval(this.#pingTimer);
       this.#failPending();
       if (this.#stopped || this.#socket !== socket) return;
-      if (event.code === CLOSE_SESSION_ENDED) {
+      if (code === CLOSE_SESSION_ENDED) {
         this.#setStatus({ status: "ended" });
         return;
       }
@@ -204,5 +236,6 @@ export class SyncClient {
       this.#setStatus({ status: "closed", retryInMs });
       this.#retryTimer = setTimeout(() => this.#connect(), retryInMs);
     };
+    socket.onclose = (event) => void onClosed(event.code);
   }
 }

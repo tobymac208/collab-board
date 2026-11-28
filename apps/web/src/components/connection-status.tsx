@@ -5,6 +5,21 @@ import { useConnectionStatus } from "@/lib/sync";
 export function ConnectionStatus() {
   const state = useConnectionStatus();
 
+  if (state.status === "outdated") {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        className="inline-flex items-center gap-2 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+      >
+        <span className="size-2 rounded-full bg-amber-500" aria-hidden />A new version is available.
+        <button type="button" className="font-medium underline" onClick={() => location.reload()}>
+          Reload
+        </button>
+      </div>
+    );
+  }
+
   const { dot, label } =
     state.status === "open"
       ? {

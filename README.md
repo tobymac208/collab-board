@@ -7,9 +7,9 @@ The interesting part is the sync engine, not the kanban UI. This project is buil
 one taking on a harder problem in real-time collaboration: conflict handling, ordering under
 concurrent edits, reconnects and offline edits, CRDTs, and horizontal scaling.
 
-> **Status:** phase 3. Changes show up instantly and roll back if the server rejects them,
-> concurrent edits to a card merge field by field (or ask when they clash), and drops keep
-> their place next to the neighbours you saw. Reconnecting and offline edits are next (phase 4).
+> **Status:** phase 4. Lose your connection and keep working: changes are saved in the browser
+> (even across a reload), sent when you're back, and anything that can no longer apply is listed
+> for review. Reconnecting fetches only what you missed. CRDTs are next (phase 5).
 
 ## Architecture
 
@@ -54,6 +54,17 @@ concurrent edits, reconnects and offline edits, CRDTs, and horizontal scaling.
   at. An edit says which version each field started from; if someone else changed that field
   since, the server rejects it with the field names and the editor shows "theirs vs mine".
   Edits to different fields merge.
+- **Catching up:** every board change is also written to a change log (kept 7 days). A client
+  that reconnects asks `open_board` for the changes since the revision it has and gets just
+  those, or a full snapshot if it's been away too long.
+- **Offline edits:** changes made while disconnected wait in a queue saved in `localStorage`
+  together with the last copy of the board, and are sent in order once the board has caught
+  up. Every change carries an `opId`; the server records applied ones, so a change resent
+  after a dropped connection is applied once. Offline changes the server refuses go to a review
+  panel; card text clashes reopen the "theirs vs mine" editor.
+- **Dead connections:** if nothing arrives from the server for 12 seconds (missed pings), the
+  client treats the connection as dead and reconnects, instead of trusting a socket a broken
+  network never closed.
 - **Moves by neighbour:** a drop names the items directly above and below it, not an index.
   The server (and the browser's prediction, using the same code) places the item right after
   the upper neighbour, or before the lower one if that's gone, so concurrent edits don't shift
@@ -95,8 +106,8 @@ pnpm dev          # web on http://localhost:3000, server on http://localhost:400
 | 0. Skeleton ✅          | Monorepo, WebSocket handshake, protocol validation, CI                        |
 | 1. Foundation ✅        | Auth, boards, columns, cards, drag and drop, Postgres                         |
 | 2. Real-time ✅         | Broadcast board changes to everyone viewing a board                           |
-| 3. Correctness 🚧       | Optimistic updates, conflict handling, stable ordering under concurrent edits |
-| 4. Resilience           | Reconnect and catch up on missed changes, offline edits                       |
+| 3. Correctness ✅       | Optimistic updates, conflict handling, stable ordering under concurrent edits |
+| 4. Resilience 🚧        | Reconnect and catch up on missed changes, offline edits                       |
 | 5. Collaboration engine | CRDTs (Yjs first, then a hand-rolled version)                                 |
 | 6. Scale                | Multiple server instances with Redis pub/sub, load tests, metrics             |
 

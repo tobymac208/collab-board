@@ -73,4 +73,41 @@ describe("CardDialog while someone else edits", () => {
     expect(screen.getByRole("alert").textContent).toContain("their notes");
     expect(description().value).toBe("my notes");
   });
+
+  it("reopens a refused edit with its text and clash, and reports when it's saved", async () => {
+    const mutate = vi.fn(async () => ({ ok: true as const, queued: true }));
+    const onSaved = vi.fn();
+    const ctx: BoardContextValue = {
+      mutate: mutate as unknown as BoardContextValue["mutate"],
+      othersOnCard: () => [],
+    };
+    render(
+      <BoardContext value={ctx}>
+        <CardDialog
+          card={{ ...base, description: "their notes", version: 3 }}
+          resume={{
+            drafts: { description: { value: "my offline notes", baseVersion: 1 } },
+            conflicts: ["description"],
+          }}
+          onSaved={onSaved}
+          onClose={() => {}}
+        />
+      </BoardContext>,
+    );
+    expect(description().value).toBe("my offline notes");
+    expect(screen.getByRole("alert").textContent).toContain("their notes");
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep mine" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    });
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "update_card",
+        description: { value: "my offline notes", baseVersion: 3 },
+      }),
+      { quiet: true },
+    );
+    expect(onSaved).toHaveBeenCalledOnce();
+  });
 });

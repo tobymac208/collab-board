@@ -23,6 +23,28 @@ describe("parseClientMessage", () => {
     );
   });
 
+  it("requires an opId on board changes, but not on reads", () => {
+    const boardId = "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a";
+    const rename = { type: "rename_board", requestId: "r", boardId, name: "x" };
+    expect(parseClientMessage(raw(rename)).ok).toBe(false);
+    expect(
+      parseClientMessage(raw({ ...rename, opId: "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f" })).ok,
+    ).toBe(true);
+    expect(parseClientMessage(raw({ type: "open_board", requestId: "r", boardId })).ok).toBe(true);
+    expect(
+      parseClientMessage(raw({ type: "open_board", requestId: "r", boardId, sinceRevision: 7 })),
+    ).toEqual({
+      ok: true,
+      value: { type: "open_board", requestId: "r", boardId, sinceRevision: 7 },
+    });
+  });
+
+  it("normalises ids to lowercase", () => {
+    const upper = "8D4B0F9E-4A6C-4B1E-9A57-2F3C1D0E5B6A";
+    const parsed = parseClientMessage(raw({ type: "open_board", requestId: "r", boardId: upper }));
+    expect(parsed).toMatchObject({ ok: true, value: { boardId: upper.toLowerCase() } });
+  });
+
   it("rejects unknown message types", () => {
     expect(parseClientMessage(raw({ type: "drop_table" })).ok).toBe(false);
   });
@@ -53,6 +75,7 @@ describe("parseClientMessage", () => {
     const move = {
       type: "move_card",
       requestId: "r",
+      opId: "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
       cardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
       toColumnId: "1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
     };
@@ -67,6 +90,7 @@ describe("parseClientMessage", () => {
     const update = {
       type: "update_card",
       requestId: "r",
+      opId: "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
       cardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
     };
     expect(parseClientMessage(raw({ ...update, title: { value: "New", baseVersion: 3 } })).ok).toBe(

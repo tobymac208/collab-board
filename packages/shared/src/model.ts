@@ -87,9 +87,16 @@ export type CardField = z.infer<typeof CardField>;
 
 // ---- field validators shared by HTTP and WebSocket requests ---------------
 
+/**
+ * A UUID, normalised to lowercase. Postgres treats UUIDs case-insensitively,
+ * but ids are also compared as strings (subscriptions, client state), so an
+ * uppercase id must never get past the edge.
+ */
+const uuid = () => z.uuid().transform((s) => s.toLowerCase());
+
 export const fields = {
   /** Every entity id is a database-generated UUID; anything else can't exist. */
-  id: z.uuid(),
+  id: uuid(),
   displayName: name(LIMITS.displayName),
   email: z.email().max(LIMITS.email),
   boardName: name(LIMITS.boardName),
@@ -97,7 +104,7 @@ export const fields = {
   cardTitle: name(LIMITS.cardTitle),
   cardDescription: z.string().max(LIMITS.cardDescription),
   /** A neighbour of a dropped item, or null at the start/end of the list. */
-  anchor: z.uuid().nullable(),
+  anchor: uuid().nullable(),
   version: z.number().int().min(0),
 };
 

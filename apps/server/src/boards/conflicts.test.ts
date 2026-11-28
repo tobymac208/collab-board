@@ -104,6 +104,24 @@ describe("concurrent card edits", () => {
     expect((await cardNow(alice, board.id, card.id)).description).toBe("");
   });
 
+  it("doesn't let your own earlier edit block your next one", async () => {
+    // e.g. two title edits queued while offline, both based on the same version.
+    const { alice, board, card } = await setup();
+    await edit(alice, card, { title: ["first try", card.version] });
+    await edit(alice, card, { title: ["second try", card.version] });
+    expect((await cardNow(alice, board.id, card.id)).title).toBe("second try");
+  });
+
+  it("still conflicts when someone else changed the field after your own edit", async () => {
+    const { alice, bob, board, card } = await setup();
+    await edit(alice, card, { title: ["alice", card.version] });
+    await edit(bob, card, { title: ["bob", card.version + 1] }); // bob saw alice's
+    await expect(edit(alice, card, { title: ["alice again", card.version] })).rejects.toMatchObject(
+      { code: "conflict", conflictingFields: ["title"] },
+    );
+    expect((await cardNow(alice, board.id, card.id)).title).toBe("bob");
+  });
+
   it("doesn't treat writing the same value as a conflict", async () => {
     const { alice, bob, card } = await setup();
     await edit(alice, card, { title: ["same", card.version] });
