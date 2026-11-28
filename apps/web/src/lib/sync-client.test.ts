@@ -94,3 +94,21 @@ describe("SyncClient heartbeat", () => {
     expect(client.getStatus().status).toBe("open");
   });
 });
+
+describe("SyncClient protocol version", () => {
+  it("stops and asks for a reload when the server runs a newer version", async () => {
+    const client = new SyncClient("ws://test/ws", { isSessionValid: async () => true });
+    client.start();
+    const socket = FakeSocket.instances[0]!;
+    socket.receive({
+      type: "welcome",
+      protocolVersion: 999,
+      connectionId: "c",
+      user: { id: "u", email: "u@x.io", displayName: "U" },
+    });
+    expect(client.getStatus().status).toBe("outdated");
+    expect(socket.closed).toBe(true);
+    await vi.runOnlyPendingTimersAsync();
+    expect(FakeSocket.instances).toHaveLength(1); // no reconnect loop
+  });
+});

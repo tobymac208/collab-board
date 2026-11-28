@@ -1,4 +1,5 @@
 import {
+  PROTOCOL_VERSION,
   parseServerMessage,
   type CardField,
   type ClientMessage,
@@ -12,7 +13,9 @@ export type ConnectionStatus =
   | { status: "open"; rttMs: number | null }
   | { status: "closed"; retryInMs: number }
   /** The session ended (logout elsewhere, expiry). No reconnects. */
-  | { status: "ended" };
+  | { status: "ended" }
+  /** The server speaks a newer protocol: this page must be reloaded. No reconnects. */
+  | { status: "outdated" };
 
 export class RequestError extends Error {
   constructor(
@@ -159,6 +162,16 @@ export class SyncClient {
       const msg = parsed.value;
       switch (msg.type) {
         case "welcome":
+          if (msg.protocolVersion !== PROTOCOL_VERSION) {
+            // A new version was deployed. Talking to it with old code would
+            // fail in confusing ways; stop and ask for a reload instead.
+            // Unsent changes stay queued (and saved) for after the reload.
+            this.#stopped = true;
+            socket.close();
+            this.#failPending();
+            this.#setStatus({ status: "outdated" });
+            return;
+          }
           welcomed = true;
           this.#attempt = 0;
           this.#setStatus({ status: "open", rttMs: null });

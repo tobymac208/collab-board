@@ -50,7 +50,7 @@ import {
   type RejectedOp,
 } from "@/lib/board-state";
 import { newId } from "@/lib/ids";
-import { forgetBoard, loadBoard, saveBoard } from "@/lib/offline-store";
+import { forgetBoard, restoreBoard, saveBoard } from "@/lib/offline-store";
 import { RequestError } from "@/lib/sync-client";
 import {
   useConnectionStatus,
@@ -109,7 +109,12 @@ export function BoardView({ boardId }: { boardId: string }) {
   const state = useMemo(() => viewOf(sync), [sync]);
   const { deleted, viewers } = sync;
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [openCard, setOpenCard] = useState<{ id: string; resume?: CardResume } | null>(null);
+  const [openCard, setOpenCard] = useState<{
+    id: string;
+    /** Reopening a refused offline edit: its text, and which rejection it came from. */
+    resume?: CardResume;
+    rejectedOpId?: string;
+  } | null>(null);
   const openCardId = openCard?.id ?? null;
   const setOpenCardId = useCallback((id: string | null) => setOpenCard(id ? { id } : null), []);
   const [sharing, setSharing] = useState(false);
@@ -134,15 +139,29 @@ export function BoardView({ boardId }: { boardId: string }) {
   // Restored in an effect rather than during render, so the server-rendered
   // page and the first browser render agree; the board appears a moment later.
 
+  /** The revision of the saved copy we restored, for catching up from it. */
+  const restoredRevision = useRef<number | undefined>(undefined);
   useEffect(() => {
     if (!myUserId) return;
-    const saved = loadBoard(myUserId, boardId);
-    if (saved) dispatch({ kind: "restored", ...saved });
+    // Not cancelled on cleanup: restoring also adopts (and removes) queues of
+    // closed tabs, and dropping that result would lose them. Restoring twice
+    // is harmless; the reducer merges by opId.
+    void restoreBoard(myUserId, boardId).then((saved) => {
+      if (!saved) return;
+      restoredRevision.current = saved.data?.revision;
+      dispatch({ kind: "restored", ...saved });
+    });
   }, [myUserId, boardId]);
 
+  /** False when the browser refused to save (storage full or blocked). */
+  const [saveFailed, setSaveFailed] = useState(false);
   useEffect(() => {
     if (!myUserId || !sync.data) return;
-    saveBoard(myUserId, boardId, { data: sync.data, ops: sync.ops, rejected: sync.rejected });
+    void saveBoard(myUserId, boardId, {
+      data: sync.data,
+      ops: sync.ops,
+      rejected: sync.rejected,
+    }).then((ok) => setSaveFailed(!ok));
   }, [myUserId, boardId, sync.data, sync.ops, sync.rejected]);
 
   useEffect(() => {
@@ -158,8 +177,10 @@ export function BoardView({ boardId }: { boardId: string }) {
    */
   const load = () => {
     setLoaded(false);
-    const since =
-      sync.data?.revision ?? (myUserId ? loadBoard(myUserId, boardId)?.data?.revision : undefined);
+    // Catch up from what we actually have: the board as shown, or the saved
+    // copy we restored. (Not a fresh read of storage, which another tab may
+    // have moved on since.)
+    const since = sync.data?.revision ?? restoredRevision.current;
     client
       .request({
         type: "open_board",
@@ -297,14 +318,18 @@ export function BoardView({ boardId }: { boardId: string }) {
 
   const unsent = unsentOps(sync).length;
 
-  /** Reopens a refused offline card edit in the editor, with the clash shown. */
+  /**
+   * Reopens a refused offline card edit in the editor, with the clash shown.
+   * The rejection stays (and stays saved) until the new edit is saved or
+   * queued, so cancelling the editor doesn't lose the text.
+   */
   function resolve(rejected: RejectedOp) {
     if (rejected.op.type !== "update_card") return;
     const { title, description } = rejected.op;
-    dispatch({ kind: "rejected_dismissed", opId: rejected.op.opId });
     setReviewing(false);
     setOpenCard({
       id: rejected.op.cardId,
+      rejectedOpId: rejected.op.opId,
       resume: {
         drafts: { ...(title ? { title } : {}), ...(description ? { description } : {}) },
         conflicts: rejected.conflictingFields,
@@ -460,6 +485,16 @@ export function BoardView({ boardId }: { boardId: string }) {
           </div>
         </div>
 
+        {saveFailed && unsent > 0 && (
+          <div
+            role="alert"
+            className="mx-6 mt-3 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200"
+          >
+            Your unsent changes couldn&apos;t be saved in this browser (storage is full or blocked).
+            Keep this tab open until they&apos;ve synced, or they&apos;ll be lost.
+          </div>
+        )}
+
         {sync.rejected.length > 0 && (
           <div
             role="alert"
@@ -519,6 +554,10 @@ export function BoardView({ boardId }: { boardId: string }) {
         <CardDialog
           card={openCardId ? state.cards[openCardId] : undefined}
           resume={openCard?.resume}
+          onSaved={() => {
+            const opId = openCard?.rejectedOpId;
+            if (opId) dispatch({ kind: "rejected_dismissed", opId });
+          }}
           onClose={() => setOpenCardId(null)}
         />
         <ReviewPanel

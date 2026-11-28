@@ -17,16 +17,21 @@ export interface CardResume {
 export function CardDialog({
   card,
   resume,
+  onSaved,
   onClose,
 }: {
   card: Card | undefined;
   resume?: CardResume | undefined;
+  /** Called once a save is accepted or safely queued. */
+  onSaved?: () => void;
   onClose: () => void;
 }) {
   return (
     <Modal open={card !== undefined} onClose={onClose} title="Edit card">
       {/* Keyed so the form resets when a different card opens. */}
-      {card && <CardForm key={card.id} card={card} resume={resume} onClose={onClose} />}
+      {card && (
+        <CardForm key={card.id} card={card} resume={resume} onSaved={onSaved} onClose={onClose} />
+      )}
     </Modal>
   );
 }
@@ -43,10 +48,12 @@ const LABELS: Record<CardField, string> = { title: "title", description: "descri
 function CardForm({
   card,
   resume,
+  onSaved,
   onClose,
 }: {
   card: Card;
   resume?: CardResume | undefined;
+  onSaved?: (() => void) | undefined;
   onClose: () => void;
 }) {
   const { mutate, othersOnCard } = useBoard();
@@ -90,6 +97,7 @@ function CardForm({
       if (value !== card[field]) changes[field] = { ...draft, value };
     }
     if (Object.keys(changes).length === 0) {
+      onSaved?.(); // nothing left to change, e.g. "Use theirs" on every clash
       onClose();
       return;
     }
@@ -100,6 +108,7 @@ function CardForm({
     );
     setSaving(false);
     if (result.ok) {
+      onSaved?.();
       onClose();
     } else if (result.error.code === "conflict") {
       setConflicts(result.error.conflictingFields);
