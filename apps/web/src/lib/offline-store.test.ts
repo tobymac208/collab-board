@@ -218,4 +218,45 @@ describe("offline store", () => {
     expect(restored!.docs!.card!.dirty).toBe(true);
     expect(countUnsent("u1")).toBe(1);
   });
+
+  it("drops an unreadable card document without losing the rest", async () => {
+    const { encodeState, newCardDoc, applyUpdate, seedUpdate, toBase64 } =
+      await import("@collab/shared");
+    const good = newCardDoc();
+    applyUpdate(good, seedUpdate("Fine", ""));
+    await saveBoard("u1", "b1", {
+      ...empty,
+      ops: [op("o1")],
+      docs: {
+        good: { state: toBase64(encodeState(good)), dirty: true },
+        bad: { state: toBase64(new Uint8Array([255, 1, 2, 3])), dirty: true },
+      },
+    });
+    const restored = await restoreBoard("u1", "b1");
+    expect(Object.keys(restored!.docs!)).toEqual(["good"]);
+    expect(opIds(restored)).toEqual(["o1"]);
+  });
+
+  it("keeps a closed tab's copy if the merged result can't be saved", async () => {
+    await saveBoard("u1", "b1", { ...empty, ops: [op("from-a")] });
+    const tabA = tab;
+    becomeTab(new MemoryStorage());
+    locks.release(tabLockOf(tabA));
+    const original = window.localStorage;
+    const full = new MemoryStorage();
+    for (let i = 0; i < original.length; i++) {
+      const key = original.key(i)!;
+      full.setItem(key, original.getItem(key)!);
+    }
+    full.setItem = () => {
+      throw new DOMException("quota", "QuotaExceededError");
+    };
+    Object.defineProperty(window, "localStorage", { value: full, configurable: true });
+    try {
+      expect(opIds(await restoreBoard("u1", "b1"))).toEqual(["from-a"]);
+      expect(full.length).toBe(1); // tab A's copy is still there for next time
+    } finally {
+      Object.defineProperty(window, "localStorage", { value: original, configurable: true });
+    }
+  });
 });

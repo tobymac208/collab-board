@@ -129,6 +129,24 @@ export function BoardView({ boardId }: { boardId: string }) {
   );
   useEffect(() => () => cardDocs.destroy(), [cardDocs]);
   const docsVersion = useSyncExternalStore(cardDocs.subscribe, cardDocs.version, () => 0);
+
+  /**
+   * Cards created here that the server hasn't confirmed yet (e.g. created
+   * offline). Their text can only sync once the card exists on the server,
+   * and their documents must be kept even though the card isn't in the
+   * confirmed state yet.
+   */
+  const unconfirmedCards = useMemo(
+    () =>
+      new Set(
+        sync.ops.flatMap((o) =>
+          o.op.type === "create_card" && o.op.id && o.confirmedAt === undefined ? [o.op.id] : [],
+        ),
+      ),
+    [sync.ops],
+  );
+  // Before setLive, so a reconnect never syncs a card the server doesn't have.
+  useEffect(() => cardDocs.setUnconfirmed(unconfirmedCards), [cardDocs, unconfirmedCards]);
   useEffect(() => cardDocs.setLive(live), [cardDocs, live]);
 
   useServerEvents((event) => {
@@ -167,9 +185,13 @@ export function BoardView({ boardId }: { boardId: string }) {
   const [saveFailed, setSaveFailed] = useState(false);
   useEffect(() => {
     if (!myUserId || !sync.data) return;
-    // Card documents are saved too, except for cards that no longer exist.
+    // Card documents are saved too: for cards the server has, and cards
+    // created here that it doesn't have yet. Not for cards whose deletion is
+    // confirmed.
     const docs = Object.fromEntries(
-      Object.entries(cardDocs.export()).filter(([cardId]) => sync.data?.cards[cardId]),
+      Object.entries(cardDocs.export()).filter(
+        ([cardId]) => sync.data?.cards[cardId] || unconfirmedCards.has(cardId),
+      ),
     );
     void saveBoard(myUserId, boardId, {
       data: sync.data,
@@ -177,7 +199,16 @@ export function BoardView({ boardId }: { boardId: string }) {
       rejected: sync.rejected,
       docs,
     }).then((ok) => setSaveFailed(!ok));
-  }, [myUserId, boardId, sync.data, sync.ops, sync.rejected, cardDocs, docsVersion]);
+  }, [
+    myUserId,
+    boardId,
+    sync.data,
+    sync.ops,
+    sync.rejected,
+    cardDocs,
+    docsVersion,
+    unconfirmedCards,
+  ]);
 
   useEffect(() => {
     if (deleted && myUserId) forgetBoard(myUserId, boardId);

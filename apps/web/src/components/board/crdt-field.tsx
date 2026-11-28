@@ -35,16 +35,23 @@ export function diffText(before: string, after: string) {
   let start = 0;
   const max = Math.min(before.length, after.length);
   while (start < max && before[start] === after[start]) start++;
+  // Never cut an emoji (or any character outside the basic plane) in half:
+  // its two UTF-16 halves must land on the same side of the edit.
+  if (start > 0 && isHighSurrogate(before.charCodeAt(start - 1))) start--;
   let end = 0;
   while (end < max - start && before[before.length - 1 - end] === after[after.length - 1 - end]) {
     end++;
   }
+  if (end > 0 && isLowSurrogate(before.charCodeAt(before.length - end))) end--;
   return {
     index: start,
     deleteCount: before.length - start - end,
     insert: after.slice(start, after.length - end),
   };
 }
+
+const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff;
 
 type FieldElement = HTMLInputElement | HTMLTextAreaElement;
 

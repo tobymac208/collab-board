@@ -205,4 +205,83 @@ describe("CardDocs", () => {
     expect(onError).toHaveBeenCalledWith("this card's text is too long to save");
     server.doc = realDoc;
   });
+
+  it("sends undo and redo, not just typing", async () => {
+    const server = new FakeServer();
+    const alice = server.connect();
+    const bob = server.connect();
+    alice.open(CARD);
+    bob.open(CARD);
+    await settle();
+    const { createUndo } = await import("@collab/shared");
+    const undo = createUndo(alice.get(CARD)!.doc, "description", LOCAL);
+    type(alice, "oops");
+    await settle();
+    expect(text(bob)).toBe("oops");
+    undo.undo();
+    await settle();
+    expect(text(bob)).toBe("");
+    expect(readText(server.doc(CARD), "description")).toBe("");
+    undo.redo();
+    await settle();
+    expect(text(bob)).toBe("oops");
+  });
+
+  it("sends continuous typing in regular batches instead of waiting for a pause", async () => {
+    const server = new FakeServer();
+    const alice = server.connect();
+    alice.open(CARD);
+    await settle();
+    server.sent = [];
+    // A keystroke every 50ms for a second: never a 150ms pause.
+    for (let i = 0; i < 20; i++) {
+      type(alice, "x", text(alice).length);
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    const sends = server.sent.filter((m) => m.type === "card_doc_update").length;
+    expect(sends).toBeGreaterThanOrEqual(5);
+    expect(sends).toBeLessThan(20); // still batched
+  });
+
+  it("retries after a failed send while connected, including later edits", async () => {
+    const onError = vi.fn();
+    const server = new FakeServer();
+    const alice = server.connect(onError);
+    alice.open(CARD);
+    await settle();
+    let failNext = true;
+    const realDoc = server.doc.bind(server);
+    server.doc = (cardId: string) => {
+      if (failNext) {
+        failNext = false;
+        throw Object.assign(new Error("database hiccup"), { code: "internal" });
+      }
+      return realDoc(cardId);
+    };
+    type(alice, "first ");
+    await settle(); // this send fails
+    type(alice, "second", text(alice).length);
+    await vi.advanceTimersByTimeAsync(3000); // backoff, then a resync
+    await settle();
+    expect(readText(realDoc(CARD), "description")).toBe("first second");
+    expect(alice.get(CARD)!.dirty).toBe(false);
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds a new card's text until the server has the card", async () => {
+    const server = new FakeServer();
+    const alice = server.connect();
+    alice.setUnconfirmed([CARD]);
+    server.sent = [];
+    const entry = alice.open(CARD, { title: "Plan", description: "" })!;
+    type(alice, "typed early");
+    await settle();
+    expect(server.sent).toEqual([]); // nothing until the card exists
+    expect(entry.dirty).toBe(true);
+
+    alice.setUnconfirmed([]); // create_card confirmed
+    await settle();
+    expect(readText(server.doc(CARD), "description")).toBe("typed early");
+    expect(entry.dirty).toBe(false);
+  });
 });

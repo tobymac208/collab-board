@@ -114,6 +114,22 @@ describe("diffText", () => {
     expect(diffText("aaa", "aa")).toEqual({ index: 2, deleteCount: 1, insert: "" });
     expect(diffText("", "new")).toEqual({ index: 0, deleteCount: 0, insert: "new" });
   });
+
+  it("never splits an emoji into halves", () => {
+    // 😀 and 😃 share their first UTF-16 half.
+    expect(diffText("a😀", "a😃")).toEqual({ index: 1, deleteCount: 2, insert: "😃" });
+    expect(diffText("😀b", "😃b")).toEqual({ index: 0, deleteCount: 2, insert: "😃" });
+    // Applying the edit gives exactly the entered text.
+    const apply = (s: string, d: ReturnType<typeof diffText>) =>
+      s.slice(0, d.index) + d.insert + s.slice(d.index + d.deleteCount);
+    for (const [before, after] of [
+      ["x😀y", "x😃y"],
+      ["👍🏽", "👍🏿"],
+      ["ab", "a😀b"],
+    ] as const) {
+      expect(apply(before, diffText(before, after))).toBe(after);
+    }
+  });
 });
 
 describe("live card editor", () => {

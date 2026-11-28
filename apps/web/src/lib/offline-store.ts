@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION, fromBase64, mergeUpdates, toBase64 } from "@collab/shared";
+import { PROTOCOL_VERSION, fromBase64, loadCardDoc, mergeUpdates, toBase64 } from "@collab/shared";
 import type { BoardState, LocalOp, RejectedOp } from "./board-state";
 import type { SavedDoc } from "./card-docs";
 
@@ -96,11 +96,28 @@ function read(key: string): SavedBoard | null {
       data: saved.data ?? null,
       ops: saved.ops,
       rejected: saved.rejected,
-      docs: saved.docs ?? {},
+      docs: validDocs(saved.docs ?? {}),
     };
   } catch {
     return null;
   }
+}
+
+/**
+ * Card documents that can actually be loaded. A corrupt one is dropped on
+ * its own, so it can't take the rest of the saved work down with it.
+ */
+function validDocs(docs: Record<string, SavedDoc>): Record<string, SavedDoc> {
+  const valid: Record<string, SavedDoc> = {};
+  for (const [cardId, doc] of Object.entries(docs)) {
+    try {
+      loadCardDoc(fromBase64(doc.state)).destroy();
+      valid[cardId] = doc;
+    } catch {
+      console.warn(`ignoring an unreadable saved copy of card ${cardId}'s text`);
+    }
+  }
+  return valid;
 }
 
 /** Every key starting with `prefix`. */
@@ -132,12 +149,18 @@ function merge(copies: SavedBoard[]): SavedBoard | null {
     for (const r of copy.rejected) if (!rejected.has(r.op.opId)) rejected.set(r.op.opId, r);
     for (const [cardId, doc] of Object.entries(copy.docs ?? {})) {
       const known = docs[cardId];
-      docs[cardId] = known
-        ? {
-            state: toBase64(mergeUpdates([fromBase64(known.state), fromBase64(doc.state)])),
-            dirty: known.dirty || doc.dirty,
-          }
-        : doc;
+      if (!known) {
+        docs[cardId] = doc;
+        continue;
+      }
+      try {
+        docs[cardId] = {
+          state: toBase64(mergeUpdates([fromBase64(known.state), fromBase64(doc.state)])),
+          dirty: known.dirty || doc.dirty,
+        };
+      } catch {
+        // Keep what we had rather than lose both copies.
+      }
     }
   }
   return { data, ops: [...ops.values()], rejected: [...rejected.values()], docs };
@@ -153,6 +176,7 @@ export async function restoreBoard(userId: string, boardId: string): Promise<Sav
   const prefix = boardPrefix(userId, boardId);
   const mine = read(`${prefix}tab:${me}`);
   const adopted: SavedBoard[] = [];
+  const adoptedKeys: string[] = [];
   const manager = locks();
   if (manager) {
     for (const key of keysWith(prefix)) {
@@ -163,11 +187,23 @@ export async function restoreBoard(userId: string, boardId: string): Promise<Sav
         if (!lock) return; // that tab is still open: its queue is its own
         const saved = read(key);
         if (saved) adopted.push(saved);
-        storage()?.removeItem(key);
+        adoptedKeys.push(key);
       });
     }
   }
-  return merge([...(mine ? [mine] : []), ...adopted]);
+  const merged = merge([...(mine ? [mine] : []), ...adopted]);
+  if (merged && adoptedKeys.length > 0) {
+    // Save the merged copy as this tab's before forgetting the closed tabs'
+    // copies, so their work is never only in memory. If it can't be saved,
+    // leave their copies for next time.
+    try {
+      storage()?.setItem(`${prefix}tab:${me}`, JSON.stringify(merged));
+      for (const key of adoptedKeys) storage()?.removeItem(key);
+    } catch {
+      // storage full or blocked: nothing deleted
+    }
+  }
+  return merged;
 }
 
 /** Saves this tab's copy. Returns false if it couldn't be saved (full or blocked). */

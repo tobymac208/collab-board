@@ -6,6 +6,7 @@ import {
   encodeStateVector,
   fromBase64,
   isEmptyUpdate,
+  isUndoOrigin,
   loadCardDoc,
   mergeUpdates,
   newCardDoc,
@@ -21,8 +22,13 @@ import {
 export const LOCAL = Symbol("local edit");
 const REMOTE = "remote";
 
-/** How long to gather keystrokes before sending them. */
+/** How long to gather keystrokes before sending them (a fixed window, not a pause). */
 const SEND_DELAY_MS = 150;
+/** Retry delays after a failed send or sync grow up to this. */
+const MAX_RETRY_MS = 30_000;
+
+/** Typed here, or undo/redo of something typed here: either way, ours to send. */
+const isLocal = (origin: unknown) => origin === LOCAL || isUndoOrigin(origin);
 
 export interface CardDocEntry {
   cardId: string;
@@ -51,6 +57,9 @@ interface Internal extends CardDocEntry {
   /** Must exchange state with the server before trusting `pending` (after a disconnect). */
   needsSync: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
+  /** Failed sends/syncs in a row, for backing off retries. */
+  failures: number;
+  retryTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 /**
@@ -69,6 +78,8 @@ interface Internal extends CardDocEntry {
 export class CardDocs {
   #entries = new Map<string, Internal>();
   #live = false;
+  /** Cards created here that the server doesn't have yet: their text waits. */
+  #unconfirmed = new Set<string>();
   #listeners = new Set<() => void>();
   #version = 0;
 
@@ -143,10 +154,12 @@ export class CardDocs {
       inFlight: 0,
       needsSync: dirty,
       timer: undefined,
+      failures: 0,
+      retryTimer: undefined,
     };
     entry.awareness.setLocalState(null); // nobody's here until the editor says so
     onDocUpdate(doc, (update, origin) => {
-      if (origin === LOCAL) {
+      if (isLocal(origin)) {
         entry.pending.push(update);
         entry.dirty = true;
         this.#schedule(entry);
@@ -176,6 +189,22 @@ export class CardDocs {
 
   // ---- talking to the server ---------------------------------------------
 
+  /**
+   * Cards created in this browser whose creation the server hasn't confirmed.
+   * Their text can't sync yet (the server would say "card not found"); once a
+   * card drops out of this set, its document syncs.
+   */
+  setUnconfirmed(cardIds: Iterable<string>): void {
+    const next = new Set(cardIds);
+    const confirmed = [...this.#unconfirmed].filter((id) => !next.has(id));
+    this.#unconfirmed = next;
+    if (!this.#live) return;
+    for (const id of confirmed) {
+      const entry = this.#entries.get(id);
+      if (entry && !entry.synced) void this.#sync(entry);
+    }
+  }
+
   /** Called whenever the board becomes live (caught up) or stops being. */
   setLive(live: boolean): void {
     if (live === this.#live) return;
@@ -183,6 +212,8 @@ export class CardDocs {
     if (!live) {
       for (const entry of this.#entries.values()) {
         clearTimeout(entry.timer);
+        clearTimeout(entry.retryTimer);
+        entry.timer = entry.retryTimer = undefined;
         entry.synced = false;
         // Whatever was in flight may or may not have arrived: re-sync to be sure.
         if (entry.dirty) entry.needsSync = true;
@@ -195,8 +226,13 @@ export class CardDocs {
 
   /** Exchanges state with the server: take what we lack, send what it lacks. */
   async #sync(entry: Internal): Promise<void> {
+    if (this.#unconfirmed.has(entry.cardId)) {
+      entry.needsSync = true; // after the server confirms the card
+      return;
+    }
+    clearTimeout(entry.retryTimer);
+    entry.retryTimer = undefined;
     entry.needsSync = false;
-    const sentPending = entry.pending.length;
     try {
       const [reply] = await this.send({
         type: "card_doc_open",
@@ -207,21 +243,29 @@ export class CardDocs {
       if (reply?.type !== "card_doc_sync") return;
       applyUpdate(entry.doc, fromBase64(reply.update), REMOTE);
       // Everything typed so far is covered by this diff.
-      entry.pending.splice(0, Math.max(sentPending, entry.pending.length));
+      entry.pending.splice(0);
       const missing = diffSince(entry.doc, fromBase64(reply.stateVector));
       if (!isEmptyUpdate(missing)) await this.#push(entry, missing);
       entry.synced = true;
+      entry.failures = 0;
       this.#settle(entry);
     } catch (err) {
       entry.needsSync = true;
-      this.#failed(err);
+      this.#failed(entry, err);
     }
   }
 
+  /**
+   * Sends pending edits within a fixed window of the first keystroke, rather
+   * than waiting for a pause, so others see continuous typing as it happens.
+   */
   #schedule(entry: Internal): void {
     if (!this.#live || entry.needsSync || !entry.synced) return; // the next sync covers it
-    clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => void this.#flush(entry), SEND_DELAY_MS);
+    if (entry.timer) return; // a send is already coming
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      void this.#flush(entry);
+    }, SEND_DELAY_MS);
   }
 
   async #flush(entry: Internal): Promise<void> {
@@ -230,8 +274,10 @@ export class CardDocs {
     try {
       await this.#push(entry, update);
     } catch (err) {
-      entry.needsSync = true; // resync on reconnect covers this batch
-      this.#failed(err);
+      // The edits are still in the document; a resync sends them, along with
+      // anything typed since.
+      entry.needsSync = true;
+      this.#failed(entry, err);
     }
     this.#settle(entry);
   }
@@ -260,9 +306,20 @@ export class CardDocs {
     if (entry.pending.length > 0) this.#schedule(entry);
   }
 
-  #failed(err: unknown): void {
+  /**
+   * After a failed send or sync. A disconnect needs nothing more: going live
+   * again resyncs. Anything else is retried while still connected, with
+   * growing delays, and reported once rather than on every attempt.
+   */
+  #failed(entry: Internal, err: unknown): void {
     const code = (err as { code?: string }).code;
-    if (code !== "disconnected") this.onError((err as Error).message);
+    if (code === "disconnected") return;
+    entry.failures++;
+    if (entry.failures === 1) this.onError((err as Error).message);
+    if (code === "not_found" || !this.#live) return; // card gone, or reconnect will retry
+    clearTimeout(entry.retryTimer);
+    const delay = Math.min(MAX_RETRY_MS, 1000 * 2 ** (entry.failures - 1));
+    entry.retryTimer = setTimeout(() => void this.#sync(entry), delay);
   }
 
   /** Server events: other people's edits and cursors. */
@@ -308,6 +365,7 @@ export class CardDocs {
     const entry = this.#entries.get(cardId);
     if (!entry) return;
     clearTimeout(entry.timer);
+    clearTimeout(entry.retryTimer);
     entry.awareness.destroy();
     entry.doc.destroy();
     this.#entries.delete(cardId);
