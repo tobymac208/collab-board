@@ -5,7 +5,7 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import { LIMITS, type Card, type Column } from "@collab/shared";
 import { newId } from "@/lib/ids";
-import { Button, InlineEdit, Input } from "../ui";
+import { Button, InlineEdit, Input, useConfirm } from "../ui";
 import { SortableCard } from "./board-card";
 import { useBoard } from "./board-context";
 
@@ -32,11 +32,25 @@ export function BoardColumn({
     isDragging,
   } = useSortable({ id: column.id, data: { type: "column" } });
 
+  const [confirm, confirmDialog] = useConfirm();
+
   async function remove() {
-    const warning = cards.length
-      ? `Delete “${column.name}” and its ${cards.length} card${cards.length === 1 ? "" : "s"}?`
-      : `Delete “${column.name}”?`;
-    if (confirm(warning)) await mutate({ type: "delete_column", columnId: column.id });
+    const ok = await confirm({
+      title: "Delete column?",
+      message: cards.length ? (
+        <>
+          <strong>{column.name}</strong> and its {cards.length} card
+          {cards.length === 1 ? "" : "s"} will be deleted for everyone on this board.
+        </>
+      ) : (
+        <>
+          <strong>{column.name}</strong> will be deleted for everyone on this board.
+        </>
+      ),
+      confirmLabel: "Delete column",
+      danger: true,
+    });
+    if (ok) await mutate({ type: "delete_column", columnId: column.id });
   }
 
   return (
@@ -83,6 +97,7 @@ export function BoardColumn({
       </SortableContext>
 
       <AddCard columnId={column.id} />
+      {confirmDialog}
     </section>
   );
 }

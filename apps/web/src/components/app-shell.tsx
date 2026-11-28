@@ -7,24 +7,26 @@ import { useAuth } from "@/lib/auth";
 import { countUnsent } from "@/lib/offline-store";
 import { SyncProvider } from "@/lib/sync";
 import { ConnectionStatus } from "./connection-status";
-import { Button } from "./ui";
+import { Button, useConfirm } from "./ui";
 
 /** Layout for the logged-in area: requires a session and owns the WebSocket. */
 export function AppShell({ children }: { children: React.ReactNode }) {
   const { state, logout, refresh } = useAuth();
   const router = useRouter();
 
+  const [confirm, confirmDialog] = useConfirm();
+
   /** Logging out discards unsent offline changes, so say so first. */
   async function confirmLogout(userId: string) {
     const unsent = countUnsent(userId);
-    if (
-      unsent > 0 &&
-      !confirm(
-        `You have ${unsent} change${unsent === 1 ? "" : "s"} that haven't reached the server yet. ` +
-          "Logging out will discard them. Log out anyway?",
-      )
-    ) {
-      return;
+    if (unsent > 0) {
+      const ok = await confirm({
+        title: "Log out with unsent changes?",
+        message: `You have ${unsent} change${unsent === 1 ? "" : "s"} that haven't reached the server yet. Logging out will discard them.`,
+        confirmLabel: "Log out anyway",
+        danger: true,
+      });
+      if (!ok) return;
     }
     await logout();
   }
@@ -68,6 +70,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         )}
       </header>
       {children}
+      {confirmDialog}
     </SyncProvider>
   );
 }

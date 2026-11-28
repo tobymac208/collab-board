@@ -3,7 +3,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { LIMITS, readText, type Card, type Viewer } from "@collab/shared";
 import type { CardDocEntry } from "@/lib/card-docs";
-import { Button, Modal } from "../ui";
+import { Button, Modal, useConfirm } from "../ui";
 import { useBoard } from "./board-context";
 import { CrdtField, type CursorState } from "./crdt-field";
 
@@ -36,8 +36,20 @@ function CardEditor({ card, onClose }: { card: Card; onClose: () => void }) {
   }, [cardDocs, card.id, card.version, card.title, card.description, live]);
   const entry = cardDocs.get(card.id);
 
+  const [confirm, confirmDialog] = useConfirm();
+
   async function remove() {
-    if (!confirm(`Delete “${card.title || "this card"}”?`)) return;
+    const ok = await confirm({
+      title: "Delete card?",
+      message: (
+        <>
+          <strong>{card.title || "This card"}</strong> will be deleted for everyone on this board.
+        </>
+      ),
+      confirmLabel: "Delete card",
+      danger: true,
+    });
+    if (!ok) return;
     onClose(); // the card disappears right away
     await mutate({ type: "delete_card", cardId: card.id });
   }
@@ -57,6 +69,7 @@ function CardEditor({ card, onClose }: { card: Card; onClose: () => void }) {
           Done
         </Button>
       </div>
+      {confirmDialog}
     </div>
   );
 }

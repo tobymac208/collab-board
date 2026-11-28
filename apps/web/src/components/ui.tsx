@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type ButtonProps = React.ComponentProps<"button"> & {
   variant?: "primary" | "secondary" | "ghost" | "danger";
@@ -117,17 +117,24 @@ export function Modal({
   onClose,
   title,
   children,
+  size = "md",
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
   children: React.ReactNode;
+  size?: "sm" | "md";
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = ref.current;
     if (!dialog) return;
-    if (open && !dialog.open) dialog.showModal();
+    if (open && !dialog.open) {
+      dialog.showModal();
+      // Opening focuses the first focusable element by default; let content
+      // pick a safer one (e.g. Cancel on a destructive confirmation).
+      dialog.querySelector<HTMLElement>("[data-autofocus]")?.focus();
+    }
     if (!open && dialog.open) dialog.close();
   }, [open]);
 
@@ -138,7 +145,7 @@ export function Modal({
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose(); // backdrop click
       }}
-      className="m-auto w-full max-w-lg rounded-lg bg-white p-0 text-zinc-900 shadow-xl backdrop:bg-black/40 dark:bg-zinc-900 dark:text-zinc-100"
+      className={`m-auto w-full ${size === "sm" ? "max-w-sm" : "max-w-lg"} rounded-lg bg-white p-0 text-zinc-900 shadow-xl backdrop:bg-black/40 dark:bg-zinc-900 dark:text-zinc-100`}
     >
       {open && (
         <div className="flex flex-col gap-4 p-5">
@@ -148,4 +155,63 @@ export function Modal({
       )}
     </dialog>
   );
+}
+
+export interface ConfirmOptions {
+  title: string;
+  message: React.ReactNode;
+  /** Label for the confirming button, e.g. "Delete column". */
+  confirmLabel: string;
+  /** Style the confirming button as destructive. */
+  danger?: boolean;
+}
+
+/**
+ * An in-app replacement for `window.confirm`. Returns a `confirm` function
+ * that opens the dialog and resolves to whether the person confirmed, plus
+ * the dialog element to render somewhere in the component:
+ *
+ *   const [confirm, confirmDialog] = useConfirm();
+ *   if (await confirm({ title: "Delete?", message: "…", confirmLabel: "Delete", danger: true })) …
+ *   return <>…{confirmDialog}</>;
+ *
+ * Escape, the backdrop and Cancel all count as "no". Cancel has focus first,
+ * so pressing Enter by reflex doesn't delete anything.
+ */
+export function useConfirm(): [(options: ConfirmOptions) => Promise<boolean>, React.ReactNode] {
+  const [request, setRequest] = useState<
+    (ConfirmOptions & { resolve: (ok: boolean) => void }) | null
+  >(null);
+
+  const confirm = useCallback(
+    (options: ConfirmOptions) =>
+      new Promise<boolean>((resolve) => setRequest({ ...options, resolve })),
+    [],
+  );
+
+  const answer = (ok: boolean) => {
+    request?.resolve(ok);
+    setRequest(null);
+  };
+
+  const dialog = (
+    <Modal
+      open={request !== null}
+      onClose={() => answer(false)}
+      title={request?.title ?? ""}
+      size="sm"
+    >
+      <div className="text-sm text-zinc-600 dark:text-zinc-400">{request?.message}</div>
+      <div className="flex justify-end gap-2">
+        <Button variant="ghost" data-autofocus onClick={() => answer(false)}>
+          Cancel
+        </Button>
+        <Button variant={request?.danger ? "danger" : "primary"} onClick={() => answer(true)}>
+          {request?.confirmLabel}
+        </Button>
+      </div>
+    </Modal>
+  );
+
+  return [confirm, dialog];
 }
