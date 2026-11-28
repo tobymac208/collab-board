@@ -242,15 +242,9 @@ describe("optimistic updates", () => {
     expect(cardsIn(sync).todo).toEqual(["c1", "c3", "c9", "c2"]);
   });
 
-  it("predicts edits and column changes", () => {
+  it("predicts column changes", () => {
     const sync = act(
       [
-        start({
-          type: "update_card",
-          cardId: "c1",
-          title: { value: "renamed", baseVersion: 0 },
-          opId: "o1",
-        }),
         start({ type: "create_column", boardId: BOARD, name: "Later", id: "later", opId: "o2" }),
         start({
           type: "move_column",
@@ -264,7 +258,6 @@ describe("optimistic updates", () => {
       loaded(),
     );
     const view = viewOf(sync)!;
-    expect(view.cards.c1?.title).toBe("renamed");
     expect(view.cards.c3).toBeUndefined(); // went with its column
     expect(layoutOf(view).columnOrder).toEqual(["later", "todo", "done"]);
   });
@@ -277,9 +270,11 @@ describe("optimistic updates", () => {
           event: { type: "card_deleted", boardId: BOARD, cardId: "c1", revision: 11 },
         },
         start({
-          type: "update_card",
+          type: "move_card",
           cardId: "c1",
-          title: { value: "x", baseVersion: 0 },
+          toColumnId: "done",
+          afterId: null,
+          beforeId: null,
           opId: "o1",
         }),
       ],
@@ -293,11 +288,7 @@ describe("offline changes", () => {
   const act = (actions: BoardAction[], from: BoardSync) =>
     actions.reduce((sync, action) => boardReducer(sync, action, BOARD), from);
   const del = (opId: string, cardId = "c1"): BoardOp => ({ type: "delete_card", cardId, opId });
-  const conflict = {
-    code: "conflict",
-    message: "someone else changed this card",
-    conflictingFields: ["title" as const],
-  };
+  const conflict = { code: "not_found", message: "card not found" };
 
   it("keeps changes made offline and counts them as unsent", () => {
     const sync = act([{ kind: "op_started", op: del("o1"), deferred: true }], loaded());

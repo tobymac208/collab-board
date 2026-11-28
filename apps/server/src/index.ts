@@ -9,7 +9,7 @@ const config = loadConfig();
 const db = connect(loadDatabaseUrl());
 await migrateToLatest(db);
 
-const { http, wss } = createAppServer(config, db);
+const { http, wss, flushCardText } = createAppServer(config, db);
 
 wss.on("connection", (socket, req) => {
   console.log(
@@ -41,7 +41,10 @@ function shutdown(signal: string): void {
   for (const client of wss.clients) client.close(1001, "server shutting down");
   wss.close();
   http.close(() => {
-    db.destroy().finally(() => process.exit(0));
+    // Save any card text copies still waiting on their debounce, then exit.
+    flushCardText()
+      .catch((err: unknown) => console.error("saving card text on shutdown failed", err))
+      .finally(() => db.destroy().finally(() => process.exit(0)));
   });
   // Don't hang forever on stuck connections.
   setTimeout(() => process.exit(1), 5_000).unref();

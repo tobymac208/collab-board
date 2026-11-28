@@ -1,6 +1,8 @@
 import type { WebSocket } from "ws";
 import type { ClientRequest, ServerEvent, User } from "@collab/shared";
 import type { DB } from "../db/schema.ts";
+import { diffSince, encodeStateVector, fromBase64, toBase64 } from "@collab/shared";
+import * as cardDocs from "../boards/card-docs.ts";
 import * as store from "../boards/store.ts";
 import type { Hub } from "./hub.ts";
 
@@ -10,6 +12,8 @@ export interface RequestContext {
   user: User;
   /** The requesting socket. Broadcasts skip it: it gets the reply instead. */
   socket: WebSocket;
+  /** Schedules refreshing a card's plain-text copy from its document. */
+  saveCardTextSoon: (cardId: string) => void;
 }
 
 /**
@@ -134,13 +138,6 @@ export async function handleRequest(
 
     case "create_card":
       return boardChange(await store.createCard(db, actorOf(msg), msg.columnId, msg.title, msg.id));
-    case "update_card":
-      return boardChange(
-        await store.updateCard(db, actorOf(msg), msg.cardId, {
-          ...(msg.title ? { title: msg.title } : {}),
-          ...(msg.description ? { description: msg.description } : {}),
-        }),
-      );
     case "move_card":
       return boardChange(
         await store.moveCard(
@@ -154,6 +151,50 @@ export async function handleRequest(
       );
     case "delete_card":
       return boardChange(await store.deleteCard(db, actorOf(msg), msg.cardId));
+
+    case "card_doc_open": {
+      const doc = await cardDocs.openCardDoc(db, uid, msg.boardId, msg.cardId);
+      return [
+        {
+          type: "card_doc_sync",
+          boardId: msg.boardId,
+          cardId: msg.cardId,
+          update: toBase64(diffSince(doc, fromBase64(msg.stateVector))),
+          stateVector: toBase64(encodeStateVector(doc)),
+        },
+      ];
+    }
+
+    case "card_doc_update": {
+      const changed = await cardDocs.applyCardDocUpdate(
+        db,
+        uid,
+        msg.boardId,
+        msg.cardId,
+        fromBase64(msg.update),
+      );
+      if (changed) {
+        // Live to everyone viewing the board; the card's plain-text copy
+        // (tiles, snapshots, catch-up) follows shortly as a board change.
+        hub.toBoard(
+          msg.boardId,
+          { type: "card_doc_update", boardId: msg.boardId, cardId: msg.cardId, update: msg.update },
+          socket,
+        );
+        ctx.saveCardTextSoon(msg.cardId);
+      }
+      return [];
+    }
+
+    case "card_awareness":
+      // Cursors aren't stored; just check access and pass them on.
+      await store.requireAccess(db, uid, msg.boardId);
+      hub.toBoard(
+        msg.boardId,
+        { type: "card_awareness", boardId: msg.boardId, cardId: msg.cardId, update: msg.update },
+        socket,
+      );
+      return [];
   }
 
   function actorOf(op: { opId: string }): store.Actor {

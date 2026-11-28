@@ -9,6 +9,7 @@ import {
   useReducer,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import {
   DndContext,
@@ -30,7 +31,7 @@ import {
   horizontalListSortingStrategy,
   sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
-import { LIMITS, type BoardMember, type Viewer } from "@collab/shared";
+import { LIMITS, readText, type BoardMember, type Viewer } from "@collab/shared";
 import { useAuth } from "@/lib/auth";
 import {
   boardReducer,
@@ -47,8 +48,8 @@ import {
   type BoardSync,
   type Layout,
   type LocalOp,
-  type RejectedOp,
 } from "@/lib/board-state";
+import { CardDocs } from "@/lib/card-docs";
 import { newId } from "@/lib/ids";
 import { forgetBoard, restoreBoard, saveBoard } from "@/lib/offline-store";
 import { RequestError } from "@/lib/sync-client";
@@ -68,7 +69,8 @@ import {
   type BoardContextValue,
   type MutationResult,
 } from "./board-context";
-import { CardDialog, type CardResume } from "./card-dialog";
+import { CardDialog } from "./card-dialog";
+import { colorFor } from "./crdt-field";
 import { ReviewPanel } from "./review-panel";
 import { ShareDialog } from "./share-dialog";
 
@@ -109,19 +111,25 @@ export function BoardView({ boardId }: { boardId: string }) {
   const state = useMemo(() => viewOf(sync), [sync]);
   const { deleted, viewers } = sync;
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [openCard, setOpenCard] = useState<{
-    id: string;
-    /** Reopening a refused offline edit: its text, and which rejection it came from. */
-    resume?: CardResume;
-    rejectedOpId?: string;
-  } | null>(null);
-  const openCardId = openCard?.id ?? null;
-  const setOpenCardId = useCallback((id: string | null) => setOpenCard(id ? { id } : null), []);
+  const [openCardId, setOpenCardId] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   /** The board has been loaded or caught up on the current connection. */
   const [loaded, setLoaded] = useState(false);
   const live = connected && loaded;
+
+  /** Card text documents for this board (live titles and descriptions). */
+  const [cardDocs] = useState(
+    () =>
+      new CardDocs(
+        boardId,
+        (body) => client.request(body),
+        (message) => notify(message),
+      ),
+  );
+  useEffect(() => () => cardDocs.destroy(), [cardDocs]);
+  const docsVersion = useSyncExternalStore(cardDocs.subscribe, cardDocs.version, () => 0);
+  useEffect(() => cardDocs.setLive(live), [cardDocs, live]);
 
   useServerEvents((event) => {
     // Someone else deleting the card you're editing closes the editor; say why.
@@ -132,6 +140,7 @@ export function BoardView({ boardId }: { boardId: string }) {
       if (gone) notify("Someone else deleted the card you were editing.");
     }
     dispatch({ kind: "event", event });
+    cardDocs.handle(event);
   });
 
   // ---- saved in the browser -------------------------------------------------
@@ -149,20 +158,26 @@ export function BoardView({ boardId }: { boardId: string }) {
     void restoreBoard(myUserId, boardId).then((saved) => {
       if (!saved) return;
       restoredRevision.current = saved.data?.revision;
-      dispatch({ kind: "restored", ...saved });
+      dispatch({ kind: "restored", data: saved.data, ops: saved.ops, rejected: saved.rejected });
+      if (saved.docs) cardDocs.import(saved.docs);
     });
-  }, [myUserId, boardId]);
+  }, [myUserId, boardId, cardDocs]);
 
   /** False when the browser refused to save (storage full or blocked). */
   const [saveFailed, setSaveFailed] = useState(false);
   useEffect(() => {
     if (!myUserId || !sync.data) return;
+    // Card documents are saved too, except for cards that no longer exist.
+    const docs = Object.fromEntries(
+      Object.entries(cardDocs.export()).filter(([cardId]) => sync.data?.cards[cardId]),
+    );
     void saveBoard(myUserId, boardId, {
       data: sync.data,
       ops: sync.ops,
       rejected: sync.rejected,
+      docs,
     }).then((ok) => setSaveFailed(!ok));
-  }, [myUserId, boardId, sync.data, sync.ops, sync.rejected]);
+  }, [myUserId, boardId, sync.data, sync.ops, sync.rejected, cardDocs, docsVersion]);
 
   useEffect(() => {
     if (deleted && myUserId) forgetBoard(myUserId, boardId);
@@ -273,11 +288,7 @@ export function BoardView({ boardId }: { boardId: string }) {
           return;
         }
         if (local.deferred) {
-          const error = {
-            code: err.code,
-            message: err.message,
-            conflictingFields: err.conflictingFields,
-          };
+          const error = { code: err.code, message: err.message };
           dispatch({ kind: "op_rejected", opId, error });
         } else {
           dispatch({ kind: "op_failed", opId }); // rolls back
@@ -307,35 +318,47 @@ export function BoardView({ boardId }: { boardId: string }) {
     [live],
   );
 
+  const me = useMemo(
+    () => ({
+      name: auth.status === "authenticated" ? auth.user.displayName : "",
+      color: colorFor(myUserId ?? ""),
+    }),
+    [auth, myUserId],
+  );
+
   const boardContext = useMemo<BoardContextValue>(
     () => ({
       mutate,
       othersOnCard: (cardId) =>
         viewers.filter((v) => v.userId !== myUserId && v.cardIds.includes(cardId)),
+      cardDocs,
+      live,
+      me,
     }),
-    [mutate, viewers, myUserId],
+    [mutate, viewers, myUserId, cardDocs, live, me],
   );
 
-  const unsent = unsentOps(sync).length;
+  const unsent = unsentOps(sync).length + cardDocs.dirtyCount();
 
   /**
-   * Reopens a refused offline card edit in the editor, with the clash shown.
-   * The rejection stays (and stays saved) until the new edit is saved or
-   * queued, so cancelling the editor doesn't lose the text.
+   * What tiles show: card text straight from open documents, so titles update
+   * as people type rather than when the plain-text copy is next saved.
    */
-  function resolve(rejected: RejectedOp) {
-    if (rejected.op.type !== "update_card") return;
-    const { title, description } = rejected.op;
-    setReviewing(false);
-    setOpenCard({
-      id: rejected.op.cardId,
-      rejectedOpId: rejected.op.opId,
-      resume: {
-        drafts: { ...(title ? { title } : {}), ...(description ? { description } : {}) },
-        conflicts: rejected.conflictingFields,
-      },
-    });
-  }
+  const shown = useMemo(() => {
+    if (!state) return state;
+    void docsVersion; // recompute when any document changes
+    let cards = state.cards;
+    for (const { cardId, doc, synced, dirty } of cardDocs.entries()) {
+      const card = cards[cardId];
+      if (!card || (!synced && !dirty)) continue; // not trustworthy yet
+      const title = readText(doc, "title");
+      const description = readText(doc, "description");
+      if (title !== card.title || description !== card.description) {
+        cards = { ...cards, [cardId]: { ...card, title, description } };
+      }
+    }
+    return cards === state.cards ? state : { ...state, cards };
+  }, [state, cardDocs, docsVersion]);
 
   // ---- drag and drop ------------------------------------------------------
   //
@@ -452,18 +475,18 @@ export function BoardView({ boardId }: { boardId: string }) {
       </main>
     );
   }
-  if (!state || !layout) {
+  if (!shown || !layout) {
     return <main className="flex-1 p-6 text-sm text-zinc-500">Loading board…</main>;
   }
 
-  const isOwner = state.board.role === "owner";
+  const isOwner = shown.board.role === "owner";
 
   return (
     <BoardContext value={boardContext}>
       <main className="flex min-h-0 flex-1 flex-col">
         <div className="flex flex-wrap items-center gap-3 px-6 pt-5">
           <InlineEdit
-            value={state.board.name}
+            value={shown.board.name}
             label="board"
             maxLength={LIMITS.boardName}
             disabled={!isOwner}
@@ -478,7 +501,7 @@ export function BoardView({ boardId }: { boardId: string }) {
                   : `${unsent} unsent change${unsent === 1 ? "" : "s"} · will sync when you're back online`}
               </span>
             )}
-            <Presence members={state.members} viewers={viewers} />
+            <Presence members={shown.members} viewers={viewers} />
             <Button variant="secondary" onClick={() => setSharing(true)}>
               {isOwner ? "Share" : "Members"}
             </Button>
@@ -521,10 +544,10 @@ export function BoardView({ boardId }: { boardId: string }) {
           <div className="flex min-h-0 flex-1 items-start gap-4 overflow-x-auto p-6">
             <SortableContext items={layout.columnOrder} strategy={horizontalListSortingStrategy}>
               {layout.columnOrder.map((columnId) => {
-                const column = state.columns[columnId];
+                const column = shown.columns[columnId];
                 if (!column) return null;
                 const cards = (layout.cardsByColumn[columnId] ?? [])
-                  .map((id) => state.cards[id])
+                  .map((id) => shown.cards[id])
                   .filter((c) => c !== undefined);
                 return (
                   <BoardColumn
@@ -540,11 +563,11 @@ export function BoardView({ boardId }: { boardId: string }) {
           </div>
 
           <DragOverlay>
-            {active?.type === "card" && state.cards[active.id] ? (
-              <CardPreview card={state.cards[active.id]!} />
-            ) : active?.type === "column" && state.columns[active.id] ? (
+            {active?.type === "card" && shown.cards[active.id] ? (
+              <CardPreview card={shown.cards[active.id]!} />
+            ) : active?.type === "column" && shown.columns[active.id] ? (
               <ColumnPreview
-                column={state.columns[active.id]!}
+                column={shown.columns[active.id]!}
                 cardCount={layout.cardsByColumn[active.id]?.length ?? 0}
               />
             ) : null}
@@ -552,27 +575,21 @@ export function BoardView({ boardId }: { boardId: string }) {
         </DndContext>
 
         <CardDialog
-          card={openCardId ? state.cards[openCardId] : undefined}
-          resume={openCard?.resume}
-          onSaved={() => {
-            const opId = openCard?.rejectedOpId;
-            if (opId) dispatch({ kind: "rejected_dismissed", opId });
-          }}
+          card={openCardId ? shown.cards[openCardId] : undefined}
           onClose={() => setOpenCardId(null)}
         />
         <ReviewPanel
           open={reviewing}
           onClose={() => setReviewing(false)}
           rejected={sync.rejected}
-          board={state}
+          board={shown}
           onDismiss={(opId) => dispatch({ kind: "rejected_dismissed", opId })}
-          onResolve={resolve}
         />
         <ShareDialog
           open={sharing}
           onClose={() => setSharing(false)}
           boardId={boardId}
-          members={state.members}
+          members={shown.members}
           isOwner={isOwner}
         />
       </main>

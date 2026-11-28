@@ -1,125 +1,43 @@
 "use client";
 
-import { useState } from "react";
-import { LIMITS, type Card, type CardField, type Viewer } from "@collab/shared";
-import { Button, Input, Modal, Textarea } from "../ui";
+import { useEffect, useSyncExternalStore } from "react";
+import { LIMITS, readText, type Card, type Viewer } from "@collab/shared";
+import type { CardDocEntry } from "@/lib/card-docs";
+import { Button, Modal } from "../ui";
 import { useBoard } from "./board-context";
+import { CrdtField, type CursorState } from "./crdt-field";
 
-/** A field the user has edited: their text, and the card version they started from. */
-type Draft = { value: string; baseVersion: number };
-
-/** Reopening an edit that was refused (e.g. made offline, then clashed). */
-export interface CardResume {
-  drafts: Partial<Record<CardField, Draft>>;
-  conflicts: CardField[];
-}
-
-export function CardDialog({
-  card,
-  resume,
-  onSaved,
-  onClose,
-}: {
-  card: Card | undefined;
-  resume?: CardResume | undefined;
-  /** Called once a save is accepted or safely queued. */
-  onSaved?: () => void;
-  onClose: () => void;
-}) {
+export function CardDialog({ card, onClose }: { card: Card | undefined; onClose: () => void }) {
   return (
     <Modal open={card !== undefined} onClose={onClose} title="Edit card">
-      {/* Keyed so the form resets when a different card opens. */}
-      {card && (
-        <CardForm key={card.id} card={card} resume={resume} onSaved={onSaved} onClose={onClose} />
-      )}
+      {/* Keyed so everything resets when a different card opens. */}
+      {card && <CardEditor key={card.id} card={card} onClose={onClose} />}
     </Modal>
   );
 }
 
-const LABELS: Record<CardField, string> = { title: "title", description: "description" };
-
 /**
- * Editing works field by field. A field you haven't touched shows the card's
- * current value, so other people's edits appear live. Once you type in a
- * field, it keeps your text and remembers which card version you started
- * from. Saving sends only your fields with those versions; if someone else
- * changed one of them meanwhile, the server says so and you choose.
+ * Live, shared editing of a card's title and description. There's no Save:
+ * every keystroke goes into the card's CRDT document and reaches everyone
+ * else viewing the board, merging with whatever they type at the same time.
  */
-function CardForm({
-  card,
-  resume,
-  onSaved,
-  onClose,
-}: {
-  card: Card;
-  resume?: CardResume | undefined;
-  onSaved?: (() => void) | undefined;
-  onClose: () => void;
-}) {
-  const { mutate, othersOnCard } = useBoard();
-  const [drafts, setDrafts] = useState<Partial<Record<CardField, Draft>>>(resume?.drafts ?? {});
-  const [conflicts, setConflicts] = useState<CardField[]>(resume?.conflicts ?? []);
-  const [saving, setSaving] = useState(false);
+function CardEditor({ card, onClose }: { card: Card; onClose: () => void }) {
+  const { mutate, othersOnCard, cardDocs, live, me } = useBoard();
+  useSyncExternalStore(cardDocs.subscribe, cardDocs.version, cardDocs.version);
 
-  const valueOf = (field: CardField) => drafts[field]?.value ?? card[field];
-
-  const edit = (field: CardField, value: string) =>
-    setDrafts((d) => ({
-      ...d,
-      [field]: { value, baseVersion: d[field]?.baseVersion ?? card.version },
-    }));
-
-  /** Drop our edit and show theirs. */
-  const takeTheirs = (field: CardField) => {
-    setDrafts((d) => {
-      const next = { ...d };
-      delete next[field];
-      return next;
-    });
-    setConflicts((c) => c.filter((f) => f !== field));
-  };
-
-  /** Keep our edit, now based on the version that includes theirs. */
-  const keepMine = (field: CardField) => {
-    setDrafts((d) => ({ ...d, [field]: { value: d[field]!.value, baseVersion: card.version } }));
-    setConflicts((c) => c.filter((f) => f !== field));
-  };
-
-  async function save(event: React.FormEvent) {
-    event.preventDefault();
-    if (!valueOf("title").trim()) return;
-    // Only fields that differ from what the card says now.
-    const changes: Partial<Record<CardField, Draft>> = {};
-    for (const field of ["title", "description"] as const) {
-      const draft = drafts[field];
-      if (!draft) continue;
-      const value = field === "title" ? draft.value.trim() : draft.value;
-      if (value !== card[field]) changes[field] = { ...draft, value };
-    }
-    if (Object.keys(changes).length === 0) {
-      onSaved?.(); // nothing left to change, e.g. "Use theirs" on every clash
-      onClose();
-      return;
-    }
-    setSaving(true);
-    const result = await mutate(
-      { type: "update_card", cardId: card.id, ...changes },
-      { quiet: true },
+  // Open (and, online, sync) the document. Offline, a card can only start
+  // from a seed, and only if its text hasn't changed since creation (version
+  // 0), since the server seeds from the same text and the two must match.
+  useEffect(() => {
+    cardDocs.open(
+      card.id,
+      card.version === 0 ? { title: card.title, description: card.description } : undefined,
     );
-    setSaving(false);
-    if (result.ok) {
-      onSaved?.();
-      onClose();
-    } else if (result.error.code === "conflict") {
-      setConflicts(result.error.conflictingFields);
-    } else {
-      setConflicts([]);
-      alert(result.error.message);
-    }
-  }
+  }, [cardDocs, card.id, card.version, card.title, card.description, live]);
+  const entry = cardDocs.get(card.id);
 
   async function remove() {
-    if (!confirm(`Delete “${card.title}”?`)) return;
+    if (!confirm(`Delete “${card.title || "this card"}”?`)) return;
     onClose(); // the card disappears right away
     await mutate({ type: "delete_card", cardId: card.id });
   }
@@ -127,63 +45,94 @@ function CardForm({
   const others = othersOnCard(card.id);
 
   return (
-    <form onSubmit={save} className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4">
       {others.length > 0 && <AlsoHere others={others} />}
-
-      <label className="flex flex-col gap-1 text-sm font-medium">
-        Title
-        <Input
-          value={valueOf("title")}
-          onChange={(e) => edit("title", e.target.value)}
-          required
-          maxLength={LIMITS.cardTitle}
-        />
-      </label>
-      {conflicts.includes("title") && (
-        <ConflictNotice
-          field="title"
-          theirs={card.title}
-          onUseTheirs={() => takeTheirs("title")}
-          onKeepMine={() => keepMine("title")}
-        />
-      )}
-
-      <label className="flex flex-col gap-1 text-sm font-medium">
-        Description
-        <Textarea
-          value={valueOf("description")}
-          onChange={(e) => edit("description", e.target.value)}
-          rows={6}
-          maxLength={LIMITS.cardDescription}
-          placeholder="Add more detail…"
-        />
-      </label>
-      {conflicts.includes("description") && (
-        <ConflictNotice
-          field="description"
-          theirs={card.description}
-          onUseTheirs={() => takeTheirs("description")}
-          onKeepMine={() => keepMine("description")}
-        />
-      )}
-
+      {entry ? <LiveFields entry={entry} card={card} me={me} /> : <ReadOnly card={card} />}
       <div className="flex items-center gap-2">
         <Button variant="danger" onClick={() => void remove()}>
           Delete
         </Button>
-        <div className="ml-auto flex gap-2">
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            type="submit"
-            disabled={saving || conflicts.length > 0 || !valueOf("title").trim()}
-          >
-            {saving ? "Saving…" : "Save"}
-          </Button>
-        </div>
+        <SyncStatus entry={entry} live={live} />
+        <Button className="ml-auto" onClick={onClose}>
+          Done
+        </Button>
       </div>
-    </form>
+    </div>
+  );
+}
+
+function LiveFields({
+  entry,
+  card,
+  me,
+}: {
+  entry: CardDocEntry;
+  card: Card;
+  me: { name: string; color: string };
+}) {
+  // Show up in others' editors while this one is open.
+  useEffect(() => {
+    entry.awareness.setLocalState({ user: me, cursor: null } satisfies CursorState);
+    return () => entry.awareness.setLocalState(null);
+  }, [entry, me]);
+
+  // A brand-new document that hasn't heard from the server yet is empty;
+  // don't let someone type into that and then see the real text appear.
+  const loading =
+    !entry.synced &&
+    readText(entry.doc, "title") === "" &&
+    readText(entry.doc, "description") === "" &&
+    (card.title !== "" || card.description !== "");
+  if (loading) return <p className="text-sm text-zinc-500">Loading…</p>;
+
+  return (
+    <>
+      <label className="flex flex-col gap-1 text-sm font-medium">
+        Title
+        <CrdtField entry={entry} field="title" label="Title" maxLength={LIMITS.cardTitle} />
+      </label>
+      <label className="flex flex-col gap-1 text-sm font-medium">
+        Description
+        <CrdtField
+          entry={entry}
+          field="description"
+          label="Description"
+          multiline
+          maxLength={LIMITS.cardDescription}
+          placeholder="Add more detail…"
+        />
+      </label>
+    </>
+  );
+}
+
+/** Offline, for a card whose text this browser doesn't have a copy of yet. */
+function ReadOnly({ card }: { card: Card }) {
+  return (
+    <div className="flex flex-col gap-3 text-sm">
+      <p className="rounded-md bg-zinc-100 px-3 py-2 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+        You&apos;re offline, and this card&apos;s text hasn&apos;t been opened here before, so it
+        can be edited once you reconnect.
+      </p>
+      <p className="font-medium">{card.title || "Untitled"}</p>
+      {card.description && (
+        <p className="whitespace-pre-wrap text-zinc-600 dark:text-zinc-400">{card.description}</p>
+      )}
+    </div>
+  );
+}
+
+function SyncStatus({ entry, live }: { entry: CardDocEntry | undefined; live: boolean }) {
+  if (!entry) return null;
+  const text = !entry.dirty
+    ? "All changes saved"
+    : live
+      ? "Saving…"
+      : "Saved on this device · will sync when you're back online";
+  return (
+    <span className="text-xs text-zinc-500" role="status">
+      {text}
+    </span>
   );
 }
 
@@ -194,44 +143,10 @@ function AlsoHere({ others }: { others: Viewer[] }) {
   return (
     <p
       role="status"
-      className="flex items-center gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950/50 dark:text-amber-200"
+      className="flex items-center gap-2 rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:bg-emerald-950/50 dark:text-emerald-200"
     >
-      <span className="size-2 rounded-full bg-amber-500" aria-hidden />
-      {list} {others.length === 1 ? "has" : "have"} this card open too.
+      <span className="size-2 rounded-full bg-emerald-500" aria-hidden />
+      {list} {others.length === 1 ? "is" : "are"} editing this card with you.
     </p>
-  );
-}
-
-function ConflictNotice({
-  field,
-  theirs,
-  onUseTheirs,
-  onKeepMine,
-}: {
-  field: CardField;
-  theirs: string;
-  onUseTheirs: () => void;
-  onKeepMine: () => void;
-}) {
-  return (
-    <div
-      role="alert"
-      className="-mt-2 flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950/40"
-    >
-      <p className="font-medium text-amber-900 dark:text-amber-200">
-        Someone else changed the {LABELS[field]} while you were editing.
-      </p>
-      <p className="text-zinc-700 dark:text-zinc-300">
-        Theirs: <span className="whitespace-pre-wrap italic">{theirs || "(empty)"}</span>
-      </p>
-      <div className="flex gap-2">
-        <Button variant="secondary" onClick={onUseTheirs}>
-          Use theirs
-        </Button>
-        <Button variant="secondary" onClick={onKeepMine}>
-          Keep mine
-        </Button>
-      </div>
-    </div>
   );
 }

@@ -1,7 +1,6 @@
 import {
   PROTOCOL_VERSION,
   parseServerMessage,
-  type CardField,
   type ClientMessage,
   type ClientRequestBody,
   type ErrorCode,
@@ -21,8 +20,6 @@ export class RequestError extends Error {
   constructor(
     readonly code: ErrorCode | "disconnected",
     message: string,
-    /** For an edit `conflict`: the fields someone else changed meanwhile. */
-    readonly conflictingFields: CardField[] = [],
   ) {
     super(message);
   }
@@ -203,7 +200,7 @@ export class SyncClient {
         case "error": {
           const pending = msg.requestId ? this.#pending.get(msg.requestId) : undefined;
           if (pending && msg.requestId) {
-            pending.reject(new RequestError(msg.code, msg.message, msg.conflictingFields));
+            pending.reject(new RequestError(msg.code, msg.message));
             this.#pending.delete(msg.requestId);
           } else {
             console.warn(`server error (${msg.code}): ${msg.message}`);

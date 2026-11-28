@@ -8,7 +8,6 @@ import {
   type BoardRole,
   type BoardSummary,
   type Card,
-  type CardField,
   type Column,
 } from "@collab/shared";
 import type { DB } from "../db/schema.ts";
@@ -30,18 +29,14 @@ import type { DB } from "../db/schema.ts";
  * between; see `positionBetweenNeighbours` for how that survives concurrent
  * edits.
  *
- * Conflicts: card fields remember the card version at which they last
- * changed. An edit based on an older version is rejected only for fields
- * that changed since (and only if the values differ), so concurrent edits to
- * different fields merge.
+ * Card text (titles and descriptions) is edited through CRDT documents in
+ * card-docs.ts, which merge instead of conflicting.
  */
 
 export class StoreError extends Error {
   constructor(
     readonly code: "not_found" | "forbidden" | "conflict",
     message: string,
-    /** For edit conflicts: the card fields someone else changed meanwhile. */
-    readonly conflictingFields?: CardField[],
   ) {
     super(message);
   }
@@ -66,7 +61,7 @@ const toColumn = (r: ColumnRow): Column => ({
   position: r.position,
 });
 
-const toCard = (r: CardRow): Card => ({
+export const toCard = (r: CardRow): Card => ({
   id: r.id,
   boardId: r.board_id,
   columnId: r.column_id,
@@ -77,7 +72,7 @@ const toCard = (r: CardRow): Card => ({
 });
 
 const COLUMN_FIELDS = ["id", "board_id", "name", "position"] as const;
-const CARD_FIELDS = [
+export const CARD_FIELDS = [
   "id",
   "board_id",
   "column_id",
@@ -94,7 +89,7 @@ const CARD_FIELDS = [
  * `not_found` rather than `forbidden`, so board ids can't be probed.
  * With `lock`, the board row stays locked until the transaction ends.
  */
-async function requireMember(
+export async function requireMember(
   db: DB,
   userId: string,
   boardId: string,
@@ -130,7 +125,7 @@ async function findColumn(db: DB, columnId: string) {
   return row;
 }
 
-async function findCard(db: DB, cardId: string) {
+export async function findCard(db: DB, cardId: string) {
   const row = await db
     .selectFrom("cards")
     .select(CARD_FIELDS)
@@ -716,90 +711,6 @@ export async function createCard(
         .returning(CARD_FIELDS)
         .executeTakeFirst();
       if (!row) throw new StoreError("conflict", "that id is already in use");
-      return toCard(row);
-    },
-    cardUpserted,
-  );
-}
-
-export type CardEdit = Partial<Record<CardField, { value: string; baseVersion: number }>>;
-
-export async function updateCard(
-  db: DB,
-  actor: Actor,
-  cardId: string,
-  edit: CardEdit,
-): Promise<BoardWrite<Card>> {
-  return writeBoard(
-    db,
-    actor,
-    boardOfCard(db, cardId),
-    {},
-    async (trx, _board, boardId) => {
-      // The board lock taken by writeBoard keeps this row stable until commit.
-      const current = await trx
-        .selectFrom("cards")
-        .select([
-          ...CARD_FIELDS,
-          "title_version",
-          "description_version",
-          "title_changed_by",
-          "description_changed_by",
-        ])
-        .where("id", "=", cardId)
-        .where("board_id", "=", boardId)
-        .executeTakeFirst();
-      if (!current) throw new StoreError("not_found", "card not found");
-      const fieldVersion = {
-        title: current.title_version,
-        description: current.description_version,
-      };
-      const changedBy = {
-        title: current.title_changed_by,
-        description: current.description_changed_by,
-      };
-
-      const changed: CardField[] = [];
-      const conflicts: CardField[] = [];
-      for (const field of ["title", "description"] as const) {
-        const change = edit[field];
-        if (!change || change.value === current[field]) continue; // nothing to do
-        // Changed since this edit started, by someone else? Our own earlier
-        // edit (say, an earlier one queued offline) isn't a conflict.
-        const changedByOther = changedBy[field] !== actor.userId;
-        if (fieldVersion[field] > change.baseVersion && changedByOther) conflicts.push(field);
-        else changed.push(field);
-      }
-      if (conflicts.length > 0) {
-        throw new StoreError(
-          "conflict",
-          "someone else changed this card while you were editing",
-          conflicts,
-        );
-      }
-      if (changed.length === 0) return toCard(current);
-
-      const version = current.version + 1;
-      const row = await trx
-        .updateTable("cards")
-        .set({
-          version,
-          updated_at: new Date(),
-          ...(changed.includes("title")
-            ? { title: edit.title!.value, title_version: version, title_changed_by: actor.userId }
-            : {}),
-          ...(changed.includes("description")
-            ? {
-                description: edit.description!.value,
-                description_version: version,
-                description_changed_by: actor.userId,
-              }
-            : {}),
-        })
-        .where("id", "=", cardId)
-        .where("board_id", "=", boardId)
-        .returning(CARD_FIELDS)
-        .executeTakeFirstOrThrow();
       return toCard(row);
     },
     cardUpserted,

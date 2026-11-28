@@ -5,6 +5,7 @@ import * as m0002 from "./migrations/0002_board_revision.ts";
 import * as m0003 from "./migrations/0003_card_versions.ts";
 import * as m0004 from "./migrations/0004_change_log.ts";
 import * as m0005 from "./migrations/0005_card_field_authors.ts";
+import * as m0006 from "./migrations/0006_card_docs.ts";
 
 /**
  * Migrations are registered explicitly rather than read from disk, so they
@@ -16,6 +17,7 @@ const migrations: Record<string, Migration> = {
   "0003_card_versions": m0003,
   "0004_change_log": m0004,
   "0005_card_field_authors": m0005,
+  "0006_card_docs": m0006,
 };
 
 const provider: MigrationProvider = { getMigrations: async () => migrations };

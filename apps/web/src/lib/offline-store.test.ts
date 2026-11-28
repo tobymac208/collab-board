@@ -91,7 +91,7 @@ const tabLockOf = (session: MemoryStorage) =>
 describe("offline store", () => {
   it("round-trips a board and its pending changes", async () => {
     expect(await saveBoard("u1", "b1", { ...empty, ops: [op("o1")] })).toBe(true);
-    expect(await restoreBoard("u1", "b1")).toEqual({ ...empty, ops: [op("o1")] });
+    expect(await restoreBoard("u1", "b1")).toEqual({ ...empty, ops: [op("o1")], docs: {} });
     expect(await restoreBoard("u1", "other")).toBeNull();
   });
 
@@ -176,5 +176,46 @@ describe("offline store", () => {
     } finally {
       Object.defineProperty(window, "localStorage", { value: original, configurable: true });
     }
+  });
+
+  it("merges card text documents from tabs that closed, keeping everyone's offline typing", async () => {
+    const {
+      editText,
+      encodeState,
+      loadCardDoc,
+      newCardDoc,
+      applyUpdate,
+      seedUpdate,
+      readText,
+      toBase64,
+      fromBase64,
+    } = await import("@collab/shared");
+    const base = newCardDoc();
+    applyUpdate(base, seedUpdate("Plan", ""));
+    const inA = loadCardDoc(encodeState(base));
+    const inB = loadCardDoc(encodeState(base));
+    editText(inA, "description", 0, 0, "from A ");
+    editText(inB, "description", 0, 0, "from B ");
+
+    await saveBoard("u1", "b1", {
+      ...empty,
+      ops: [],
+      docs: { card: { state: toBase64(encodeState(inA)), dirty: true } },
+    });
+    const tabA = tab;
+    becomeTab(new MemoryStorage());
+    await saveBoard("u1", "b1", {
+      ...empty,
+      ops: [],
+      docs: { card: { state: toBase64(encodeState(inB)), dirty: true } },
+    });
+    locks.release(tabLockOf(tabA));
+
+    const restored = await restoreBoard("u1", "b1");
+    const merged = loadCardDoc(fromBase64(restored!.docs!.card!.state));
+    expect(readText(merged, "description")).toContain("from A");
+    expect(readText(merged, "description")).toContain("from B");
+    expect(restored!.docs!.card!.dirty).toBe(true);
+    expect(countUnsent("u1")).toBe(1);
   });
 });

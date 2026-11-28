@@ -17,7 +17,9 @@
     "@dnd-kit/utilities": "^3.2.2",
     "next": "16.4.6",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.33"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "4.3.3",

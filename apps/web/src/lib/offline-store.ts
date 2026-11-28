@@ -1,5 +1,6 @@
-import { PROTOCOL_VERSION } from "@collab/shared";
+import { PROTOCOL_VERSION, fromBase64, mergeUpdates, toBase64 } from "@collab/shared";
 import type { BoardState, LocalOp, RejectedOp } from "./board-state";
+import type { SavedDoc } from "./card-docs";
 
 /**
  * Saves each open board, and the user's unsent changes to it, in the
@@ -23,6 +24,8 @@ export interface SavedBoard {
   data: BoardState | null;
   ops: LocalOp[];
   rejected: RejectedOp[];
+  /** Card text documents opened on this board, by card id. */
+  docs?: Record<string, SavedDoc>;
 }
 
 const PREFIX = "collab-board";
@@ -89,7 +92,12 @@ function read(key: string): SavedBoard | null {
   try {
     const saved = JSON.parse(raw) as Partial<SavedBoard>;
     if (!Array.isArray(saved.ops) || !Array.isArray(saved.rejected)) return null;
-    return { data: saved.data ?? null, ops: saved.ops, rejected: saved.rejected };
+    return {
+      data: saved.data ?? null,
+      ops: saved.ops,
+      rejected: saved.rejected,
+      docs: saved.docs ?? {},
+    };
   } catch {
     return null;
   }
@@ -107,18 +115,32 @@ function keysWith(prefix: string): string[] {
   return keys;
 }
 
-/** Combines saved copies: the newest board data, and every change once. */
+/**
+ * Combines saved copies: the newest board data, every change once, and card
+ * documents merged (they're CRDTs, so text typed offline in two tabs that
+ * have since closed is all kept).
+ */
 function merge(copies: SavedBoard[]): SavedBoard | null {
   if (copies.length === 0) return null;
   let data: BoardState | null = null;
   const ops = new Map<string, LocalOp>();
   const rejected = new Map<string, RejectedOp>();
+  const docs: Record<string, SavedDoc> = {};
   for (const copy of copies) {
     if (copy.data && (!data || copy.data.revision > data.revision)) data = copy.data;
     for (const op of copy.ops) if (!ops.has(op.op.opId)) ops.set(op.op.opId, op);
     for (const r of copy.rejected) if (!rejected.has(r.op.opId)) rejected.set(r.op.opId, r);
+    for (const [cardId, doc] of Object.entries(copy.docs ?? {})) {
+      const known = docs[cardId];
+      docs[cardId] = known
+        ? {
+            state: toBase64(mergeUpdates([fromBase64(known.state), fromBase64(doc.state)])),
+            dirty: known.dirty || doc.dirty,
+          }
+        : doc;
+    }
   }
-  return { data, ops: [...ops.values()], rejected: [...rejected.values()] };
+  return { data, ops: [...ops.values()], rejected: [...rejected.values()], docs };
 }
 
 /**
@@ -172,12 +194,16 @@ export function forgetBoard(userId: string, boardId: string): void {
   for (const key of keysWith(boardPrefix(userId, boardId))) storage()?.removeItem(key);
 }
 
-/** How many changes this user has that haven't reached the server yet. */
+/** How many changes (and card texts) this user has that haven't reached the server yet. */
 export function countUnsent(userId: string): number {
-  const unsent = new Set<string>(); // by opId: adopted copies may overlap
+  const unsent = new Set<string>(); // by opId / card: adopted copies may overlap
   for (const key of keysWith(userPrefix(userId))) {
-    for (const op of read(key)?.ops ?? []) {
+    const saved = read(key);
+    for (const op of saved?.ops ?? []) {
       if (op.confirmedAt === undefined) unsent.add(op.op.opId);
+    }
+    for (const [cardId, doc] of Object.entries(saved?.docs ?? {})) {
+      if (doc.dirty) unsent.add(`text:${cardId}`);
     }
   }
   return unsent.size;
