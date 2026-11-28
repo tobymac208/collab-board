@@ -3,6 +3,7 @@
 import { createContext, useContext } from "react";
 import type { Viewer } from "@collab/shared";
 import type { BoardOp } from "@/lib/board-state";
+import type { CardDocs } from "@/lib/card-docs";
 import type { RequestError } from "@/lib/sync-client";
 
 /**
@@ -26,6 +27,12 @@ export interface BoardContextValue {
   mutate: (op: NewBoardOp, options?: { quiet?: boolean }) => Promise<MutationResult>;
   /** Other people who have this card open (never includes the current user). */
   othersOnCard: (cardId: string) => Viewer[];
+  /** Card text documents (titles and descriptions, edited live). */
+  cardDocs: CardDocs;
+  /** The board is connected and caught up. */
+  live: boolean;
+  /** How the current user appears to others in a card (cursor label and colour). */
+  me: { name: string; color: string };
 }
 
 export const BoardContext = createContext<BoardContextValue | null>(null);

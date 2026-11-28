@@ -59,12 +59,7 @@ export interface CardsTable {
   position: string;
   /** Incremented by every change to the card. */
   version: ColumnType<number, never, number>;
-  /** The card version at which each editable field last changed. */
-  title_version: ColumnType<number, never, number>;
-  description_version: ColumnType<number, never, number>;
-  /** Who made each field's latest change (null if unknown or the user was deleted). */
-  title_changed_by: ColumnType<string | null, never, string>;
-  description_changed_by: ColumnType<string | null, never, string>;
+
   created_at: CreatedAt;
   updated_at: Timestamp;
 }
@@ -86,6 +81,16 @@ export interface AppliedOpsTable {
   created_at: CreatedAt;
 }
 
+export interface CardDocsTable {
+  card_id: string;
+  board_id: string;
+  /** The card's text document, encoded (see @collab/shared crdt). */
+  state: Uint8Array;
+  /** The plain-text copy on `cards` is behind the document. */
+  dirty: ColumnType<boolean, boolean | undefined, boolean>;
+  updated_at: Timestamp;
+}
+
 export interface Database {
   users: UsersTable;
   sessions: SessionsTable;
@@ -95,6 +100,7 @@ export interface Database {
   cards: CardsTable;
   board_changes: BoardChangesTable;
   applied_ops: AppliedOpsTable;
+  card_docs: CardDocsTable;
 }
 
 export type DB = Kysely<Database>;

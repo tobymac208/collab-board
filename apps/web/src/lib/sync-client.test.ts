@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PROTOCOL_VERSION } from "@collab/shared";
 import { HEARTBEAT_TIMEOUT_MS, RequestError, SyncClient } from "./sync-client.ts";
 
 /** A WebSocket stand-in the test drives by hand. */
@@ -27,7 +28,7 @@ class FakeSocket {
   welcome() {
     this.receive({
       type: "welcome",
-      protocolVersion: 5,
+      protocolVersion: PROTOCOL_VERSION,
       connectionId: "c",
       user: { id: "u", email: "u@x.io", displayName: "U" },
     });

@@ -1,14 +1,5 @@
 import { z } from "zod";
-import {
-  BoardMember,
-  BoardSummary,
-  Card,
-  CardField,
-  Column,
-  User,
-  Viewer,
-  fields,
-} from "./model.ts";
+import { BoardMember, BoardSummary, Card, Column, User, Viewer, fields } from "./model.ts";
 
 /**
  * Wire protocol between the browser and the WebSocket server.
@@ -45,16 +36,25 @@ import {
  * replies with those changes as ordinary events, or with a full snapshot if
  * it no longer has them all.
  *
- * Conflicts: card edits say which card version each field was based on. If
- * someone else changed that field since, the edit is rejected with a
- * `conflict` error listing the fields; edits to different fields merge.
+ * Card text: a card's title and description are a CRDT document (see
+ * crdt.ts), synced separately from the board's ordered changes. Opening a
+ * card exchanges state vectors (`card_doc_open` / `card_doc_sync`), then
+ * edits flow both ways as `card_doc_update`, relayed to everyone viewing the
+ * board. Updates merge in any order and applying one twice is harmless, so
+ * these need no opId and no revision. The plain-text title and description
+ * on the card itself are refreshed from the document shortly after edits, as
+ * an ordinary revisioned `card_upserted`. Cursors and selections travel as
+ * `card_awareness`, relayed and never stored.
  */
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 // ---- client -> server ----------------------------------------------------
 
 const requestId = z.string().min(1).max(64);
+
+/** Binary CRDT data (updates, state vectors), base64 on the wire. */
+const bytes = z.base64().max(400_000);
 
 const request = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) =>
   z.object({ type: z.literal(type), requestId, ...shape });
@@ -107,14 +107,6 @@ export const ClientMessage = z.discriminatedUnion("type", [
     /** Client-generated, so the card can be shown before the server replies. */
     id: fields.id.optional(),
   }),
-  op("update_card", {
-    cardId: fields.id,
-    /** Each changed field, with the card version the edit to it started from. */
-    title: z.object({ value: fields.cardTitle, baseVersion: fields.version }).optional(),
-    description: z
-      .object({ value: fields.cardDescription, baseVersion: fields.version })
-      .optional(),
-  }),
   op("move_card", {
     cardId: fields.id,
     toColumnId: fields.id,
@@ -122,6 +114,13 @@ export const ClientMessage = z.discriminatedUnion("type", [
     beforeId: fields.anchor,
   }),
   op("delete_card", { cardId: fields.id }),
+
+  /** Opens a card's text document: "here's what I have" (a state vector). */
+  request("card_doc_open", { boardId: fields.id, cardId: fields.id, stateVector: bytes }),
+  /** Edits to a card's text document, to merge and pass on. */
+  request("card_doc_update", { boardId: fields.id, cardId: fields.id, update: bytes }),
+  /** This client's cursor and selection in a card, for others to see. */
+  request("card_awareness", { boardId: fields.id, cardId: fields.id, update: bytes }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 export type ClientRequest = Exclude<ClientMessage, { type: "ping" }>;
@@ -175,6 +174,20 @@ export const ServerEvent = z.discriminatedUnion("type", [
   event("card_deleted", { boardId: fields.id, cardId: fields.id, revision }),
   /** Who has the board open right now, one entry per person. Not revisioned. */
   event("presence", { boardId: fields.id, viewers: z.array(Viewer) }),
+  /**
+   * Answer to card_doc_open: what the client was missing, and the server's
+   * state vector so the client can send back what the server is missing.
+   */
+  event("card_doc_sync", {
+    boardId: fields.id,
+    cardId: fields.id,
+    update: bytes,
+    stateVector: bytes,
+  }),
+  /** Someone's edits to a card's text. */
+  event("card_doc_update", { boardId: fields.id, cardId: fields.id, update: bytes }),
+  /** Someone's cursor or selection in a card. */
+  event("card_awareness", { boardId: fields.id, cardId: fields.id, update: bytes }),
 ]);
 export type ServerEvent = z.infer<typeof ServerEvent>;
 
@@ -200,8 +213,6 @@ export const ServerMessage = z.discriminatedUnion("type", [
     requestId: requestId.optional(),
     code: ErrorCode,
     message: z.string(),
-    /** For a `conflict` on update_card: the fields someone else changed meanwhile. */
-    conflictingFields: z.array(CardField).optional(),
   }),
   ...ServerEvent.options,
 ]);

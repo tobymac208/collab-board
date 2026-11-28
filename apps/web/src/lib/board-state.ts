@@ -6,7 +6,6 @@ import {
   type BoardMember,
   type BoardSummary,
   type Card,
-  type CardField,
   type ClientRequestBody,
   type Column,
   type ServerEvent,
@@ -77,7 +76,6 @@ export type BoardOp = Extract<
       | "move_column"
       | "delete_column"
       | "create_card"
-      | "update_card"
       | "move_card"
       | "delete_card";
   }
@@ -100,7 +98,6 @@ export interface RejectedOp {
   op: BoardOp;
   code: string;
   message: string;
-  conflictingFields: CardField[];
 }
 
 export type BoardAction =
@@ -182,16 +179,6 @@ export function applyLocal(state: BoardState, op: BoardOp): BoardState {
         version: 0,
       };
       return { ...state, cards: { ...state.cards, [card.id]: card } };
-    }
-    case "update_card": {
-      const card = state.cards[op.cardId];
-      if (!card) return state;
-      const next = {
-        ...card,
-        ...(op.title ? { title: op.title.value } : {}),
-        ...(op.description ? { description: op.description.value } : {}),
-      };
-      return { ...state, cards: { ...state.cards, [card.id]: next } };
     }
     case "move_card": {
       const card = state.cards[op.cardId];

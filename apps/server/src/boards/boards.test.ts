@@ -101,9 +101,16 @@ describe("membership and access", () => {
       mallory.request({ type: "rename_board", boardId: board.id, name: "pwned" }),
       mallory.request({ type: "create_card", columnId: columns[0]!.id, title: "x" }),
       mallory.request({
-        type: "update_card",
+        type: "card_doc_open",
+        boardId: board.id,
         cardId: card.id,
-        title: { value: "x", baseVersion: 0 },
+        stateVector: "AA==",
+      }),
+      mallory.request({
+        type: "card_doc_update",
+        boardId: board.id,
+        cardId: card.id,
+        update: "AAA=",
       }),
       mallory.request({ type: "delete_card", cardId: card.id }),
       mallory.request({ type: "delete_column", columnId: columns[0]!.id }),
@@ -220,33 +227,6 @@ describe("cards", () => {
     const todo = columnNamed((await snapshot(alice, board.id)).columns, "To do");
     for (const title of ["a", "b", "c"]) await addCard(alice, todo.id, title);
     expect(await layout(alice, board.id)).toMatchObject({ "To do": ["a", "b", "c"] });
-  });
-
-  it("updates title and description independently", async () => {
-    const board = await createBoard(alice);
-    const todo = columnNamed((await snapshot(alice, board.id)).columns, "To do");
-    const card = await addCard(alice, todo.id, "draft");
-
-    const withDescription = only(
-      await alice.request({
-        type: "update_card",
-        cardId: card.id,
-        description: { value: "details", baseVersion: card.version },
-      }),
-      "card_upserted",
-    ).card;
-    expect(withDescription).toMatchObject({ title: "draft", description: "details" });
-    expect(withDescription.version).toBe(card.version + 1);
-
-    const retitled = only(
-      await alice.request({
-        type: "update_card",
-        cardId: card.id,
-        title: { value: "final", baseVersion: withDescription.version },
-      }),
-      "card_upserted",
-    ).card;
-    expect(retitled).toMatchObject({ title: "final", description: "details" });
   });
 
   it("moves cards within and across columns", async () => {

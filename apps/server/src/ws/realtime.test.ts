@@ -78,7 +78,7 @@ describe("broadcasting board changes", () => {
     expect(withoutPresence(await owner.client.drain())).toEqual([]);
   });
 
-  it("covers moves, edits and deletes, each with the next revision", async () => {
+  it("covers moves, renames and deletes, each with the next revision", async () => {
     const { owner, editor, board } = await sharedBoard();
     const snap = await open(owner.client, board.id);
     await open(editor.client, board.id);
@@ -95,18 +95,12 @@ describe("broadcasting board changes", () => {
       afterId: null,
       beforeId: null,
     });
-    await owner.client.request({
-      type: "update_card",
-      cardId: card.id,
-      title: { value: "b", baseVersion: card.version },
-    });
     await owner.client.request({ type: "rename_column", columnId: todo!.id, name: "Backlog" });
     await owner.client.request({ type: "delete_card", cardId: card.id });
     await owner.client.request({ type: "delete_column", columnId: todo!.id });
 
     const seen = withoutPresence(await editor.client.drain());
     expect(types(seen)).toEqual([
-      "card_upserted",
       "card_upserted",
       "card_upserted",
       "column_upserted",

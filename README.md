@@ -7,9 +7,9 @@ The interesting part is the sync engine, not the kanban UI. This project is buil
 one taking on a harder problem in real-time collaboration: conflict handling, ordering under
 concurrent edits, reconnects and offline edits, CRDTs, and horizontal scaling.
 
-> **Status:** phase 4. Lose your connection and keep working: changes are saved in the browser
-> (even across a reload), sent when you're back, and anything that can no longer apply is listed
-> for review. Reconnecting fetches only what you missed. CRDTs are next (phase 5).
+> **Status:** phase 5a. Card titles and descriptions are live, shared text: type together and
+> see each other's cursors, and offline edits merge character by character (Yjs). Next: our own
+> text CRDT in place of Yjs (phase 5b).
 
 ## Architecture
 
@@ -50,10 +50,14 @@ concurrent edits, reconnects and offline edits, CRDTs, and horizontal scaling.
   of the server-confirmed state, so they show instantly, other people's changes slot in
   underneath, and a rejected change just disappears. New cards and columns get their id from
   the browser so they can be shown before the server replies.
-- **Conflicts:** cards have a version, and each field remembers the version it last changed
-  at. An edit says which version each field started from; if someone else changed that field
-  since, the server rejects it with the field names and the editor shows "theirs vs mine".
-  Edits to different fields merge.
+- **Card text (CRDT):** each card's title and description live in a Yjs document
+  (`packages/shared/src/crdt.ts`, the only code that touches Yjs's document format, stored in
+  `card_docs`). Opening a card exchanges state vectors; keystrokes are batched and relayed to
+  everyone viewing the board; edits merge in any order, so there's no conflict to resolve.
+  The plain-text copy on the card (tiles, snapshots, catch-up) is refreshed about once a second
+  while someone types. Documents are seeded deterministically from a card's text, so a server
+  seed and an offline browser seed are the same edit. Cursors travel as Yjs awareness, never
+  stored. Undo only undoes your own typing.
 - **Catching up:** every board change is also written to a change log (kept 7 days). A client
   that reconnects asks `open_board` for the changes since the revision it has and gets just
   those, or a full snapshot if it's been away too long.
@@ -101,15 +105,15 @@ pnpm dev          # web on http://localhost:3000, server on http://localhost:400
 
 ## Roadmap
 
-| Phase                   | Scope                                                                         |
-| ----------------------- | ----------------------------------------------------------------------------- |
-| 0. Skeleton ✅          | Monorepo, WebSocket handshake, protocol validation, CI                        |
-| 1. Foundation ✅        | Auth, boards, columns, cards, drag and drop, Postgres                         |
-| 2. Real-time ✅         | Broadcast board changes to everyone viewing a board                           |
-| 3. Correctness ✅       | Optimistic updates, conflict handling, stable ordering under concurrent edits |
-| 4. Resilience 🚧        | Reconnect and catch up on missed changes, offline edits                       |
-| 5. Collaboration engine | CRDTs (Yjs first, then a hand-rolled version)                                 |
-| 6. Scale                | Multiple server instances with Redis pub/sub, load tests, metrics             |
+| Phase                      | Scope                                                                         |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| 0. Skeleton ✅             | Monorepo, WebSocket handshake, protocol validation, CI                        |
+| 1. Foundation ✅           | Auth, boards, columns, cards, drag and drop, Postgres                         |
+| 2. Real-time ✅            | Broadcast board changes to everyone viewing a board                           |
+| 3. Correctness ✅          | Optimistic updates, conflict handling, stable ordering under concurrent edits |
+| 4. Resilience ✅           | Reconnect and catch up on missed changes, offline edits                       |
+| 5. Collaboration engine 🚧 | CRDTs (Yjs first, then a hand-rolled version)                                 |
+| 6. Scale                   | Multiple server instances with Redis pub/sub, load tests, metrics             |
 
 ## License
 

@@ -86,18 +86,17 @@ describe("parseClientMessage", () => {
     expect(parseClientMessage(raw({ ...move, toIndex: 0 })).ok).toBe(false);
   });
 
-  it("requires a base version for each edited card field", () => {
-    const update = {
-      type: "update_card",
-      requestId: "r",
-      opId: "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f",
-      cardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
+  it("carries card text edits as base64 bytes", () => {
+    const ids = {
+      boardId: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
+      cardId: "1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
     };
-    expect(parseClientMessage(raw({ ...update, title: { value: "New", baseVersion: 3 } })).ok).toBe(
-      true,
-    );
-    expect(parseClientMessage(raw({ ...update, title: "New" })).ok).toBe(false);
-    expect(parseClientMessage(raw({ ...update, title: { value: "New" } })).ok).toBe(false);
+    const update = { type: "card_doc_update", requestId: "r", ...ids };
+    expect(parseClientMessage(raw({ ...update, update: "AQID" })).ok).toBe(true);
+    expect(parseClientMessage(raw({ ...update, update: "not base64!" })).ok).toBe(false);
+    expect(
+      parseClientMessage(raw({ type: "update_card", requestId: "r", opId: ids.cardId })).ok,
+    ).toBe(false); // text no longer goes through update_card
   });
 });
 

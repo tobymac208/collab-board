@@ -17,6 +17,8 @@ import { createTestDb } from "./pglite.ts";
 export interface TestServer {
   base: string;
   db: DB;
+  /** Saves card text copies now instead of waiting for their delay. */
+  flushCardText: () => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -33,7 +35,7 @@ export function useTestDb(): () => DB {
     await db?.destroy();
   });
   beforeEach(async () => {
-    await sql`TRUNCATE users, sessions, boards, board_members, board_columns, cards, board_changes, applied_ops`.execute(
+    await sql`TRUNCATE users, sessions, boards, board_members, board_columns, cards, board_changes, applied_ops, card_docs`.execute(
       db!,
     );
   });
@@ -45,16 +47,18 @@ export async function startServer(
   allowedOrigins: string[] = [],
   options: AppServerOptions = {},
 ): Promise<TestServer> {
-  const { http, wss } = createAppServer(
+  const { http, wss, flushCardText } = createAppServer(
     { port: 0, allowedOrigins, cookieSecure: false },
     db,
-    options,
+    // Quick card text saves, so tests don't wait a second for each.
+    { cardTextSaveDelayMs: 20, ...options },
   );
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
   const { port } = http.address() as AddressInfo;
   return {
     base: `127.0.0.1:${port}`,
     db,
+    flushCardText,
     close: async () => {
       for (const c of wss.clients) c.terminate();
       wss.close();
@@ -150,12 +154,7 @@ export async function connectClient(
         owner.resolve(owner.events);
       } else if (msg.type === "error") {
         pending.delete(msg.requestId);
-        owner.reject(
-          Object.assign(new Error(msg.message), {
-            code: msg.code,
-            ...(msg.conflictingFields ? { conflictingFields: msg.conflictingFields } : {}),
-          }),
-        );
+        owner.reject(Object.assign(new Error(msg.message), { code: msg.code }));
       } else {
         owner.events.push(msg);
       }

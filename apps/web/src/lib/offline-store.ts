@@ -1,5 +1,6 @@
-import { PROTOCOL_VERSION } from "@collab/shared";
+import { PROTOCOL_VERSION, fromBase64, loadCardDoc, mergeUpdates, toBase64 } from "@collab/shared";
 import type { BoardState, LocalOp, RejectedOp } from "./board-state";
+import type { SavedDoc } from "./card-docs";
 
 /**
  * Saves each open board, and the user's unsent changes to it, in the
@@ -23,6 +24,8 @@ export interface SavedBoard {
   data: BoardState | null;
   ops: LocalOp[];
   rejected: RejectedOp[];
+  /** Card text documents opened on this board, by card id. */
+  docs?: Record<string, SavedDoc>;
 }
 
 const PREFIX = "collab-board";
@@ -89,10 +92,32 @@ function read(key: string): SavedBoard | null {
   try {
     const saved = JSON.parse(raw) as Partial<SavedBoard>;
     if (!Array.isArray(saved.ops) || !Array.isArray(saved.rejected)) return null;
-    return { data: saved.data ?? null, ops: saved.ops, rejected: saved.rejected };
+    return {
+      data: saved.data ?? null,
+      ops: saved.ops,
+      rejected: saved.rejected,
+      docs: validDocs(saved.docs ?? {}),
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * Card documents that can actually be loaded. A corrupt one is dropped on
+ * its own, so it can't take the rest of the saved work down with it.
+ */
+function validDocs(docs: Record<string, SavedDoc>): Record<string, SavedDoc> {
+  const valid: Record<string, SavedDoc> = {};
+  for (const [cardId, doc] of Object.entries(docs)) {
+    try {
+      loadCardDoc(fromBase64(doc.state)).destroy();
+      valid[cardId] = doc;
+    } catch {
+      console.warn(`ignoring an unreadable saved copy of card ${cardId}'s text`);
+    }
+  }
+  return valid;
 }
 
 /** Every key starting with `prefix`. */
@@ -107,18 +132,38 @@ function keysWith(prefix: string): string[] {
   return keys;
 }
 
-/** Combines saved copies: the newest board data, and every change once. */
+/**
+ * Combines saved copies: the newest board data, every change once, and card
+ * documents merged (they're CRDTs, so text typed offline in two tabs that
+ * have since closed is all kept).
+ */
 function merge(copies: SavedBoard[]): SavedBoard | null {
   if (copies.length === 0) return null;
   let data: BoardState | null = null;
   const ops = new Map<string, LocalOp>();
   const rejected = new Map<string, RejectedOp>();
+  const docs: Record<string, SavedDoc> = {};
   for (const copy of copies) {
     if (copy.data && (!data || copy.data.revision > data.revision)) data = copy.data;
     for (const op of copy.ops) if (!ops.has(op.op.opId)) ops.set(op.op.opId, op);
     for (const r of copy.rejected) if (!rejected.has(r.op.opId)) rejected.set(r.op.opId, r);
+    for (const [cardId, doc] of Object.entries(copy.docs ?? {})) {
+      const known = docs[cardId];
+      if (!known) {
+        docs[cardId] = doc;
+        continue;
+      }
+      try {
+        docs[cardId] = {
+          state: toBase64(mergeUpdates([fromBase64(known.state), fromBase64(doc.state)])),
+          dirty: known.dirty || doc.dirty,
+        };
+      } catch {
+        // Keep what we had rather than lose both copies.
+      }
+    }
   }
-  return { data, ops: [...ops.values()], rejected: [...rejected.values()] };
+  return { data, ops: [...ops.values()], rejected: [...rejected.values()], docs };
 }
 
 /**
@@ -131,6 +176,7 @@ export async function restoreBoard(userId: string, boardId: string): Promise<Sav
   const prefix = boardPrefix(userId, boardId);
   const mine = read(`${prefix}tab:${me}`);
   const adopted: SavedBoard[] = [];
+  const adoptedKeys: string[] = [];
   const manager = locks();
   if (manager) {
     for (const key of keysWith(prefix)) {
@@ -141,11 +187,23 @@ export async function restoreBoard(userId: string, boardId: string): Promise<Sav
         if (!lock) return; // that tab is still open: its queue is its own
         const saved = read(key);
         if (saved) adopted.push(saved);
-        storage()?.removeItem(key);
+        adoptedKeys.push(key);
       });
     }
   }
-  return merge([...(mine ? [mine] : []), ...adopted]);
+  const merged = merge([...(mine ? [mine] : []), ...adopted]);
+  if (merged && adoptedKeys.length > 0) {
+    // Save the merged copy as this tab's before forgetting the closed tabs'
+    // copies, so their work is never only in memory. If it can't be saved,
+    // leave their copies for next time.
+    try {
+      storage()?.setItem(`${prefix}tab:${me}`, JSON.stringify(merged));
+      for (const key of adoptedKeys) storage()?.removeItem(key);
+    } catch {
+      // storage full or blocked: nothing deleted
+    }
+  }
+  return merged;
 }
 
 /** Saves this tab's copy. Returns false if it couldn't be saved (full or blocked). */
@@ -172,12 +230,16 @@ export function forgetBoard(userId: string, boardId: string): void {
   for (const key of keysWith(boardPrefix(userId, boardId))) storage()?.removeItem(key);
 }
 
-/** How many changes this user has that haven't reached the server yet. */
+/** How many changes (and card texts) this user has that haven't reached the server yet. */
 export function countUnsent(userId: string): number {
-  const unsent = new Set<string>(); // by opId: adopted copies may overlap
+  const unsent = new Set<string>(); // by opId / card: adopted copies may overlap
   for (const key of keysWith(userPrefix(userId))) {
-    for (const op of read(key)?.ops ?? []) {
+    const saved = read(key);
+    for (const op of saved?.ops ?? []) {
       if (op.confirmedAt === undefined) unsent.add(op.op.opId);
+    }
+    for (const [cardId, doc] of Object.entries(saved?.docs ?? {})) {
+      if (doc.dirty) unsent.add(`text:${cardId}`);
     }
   }
   return unsent.size;

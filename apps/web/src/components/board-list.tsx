@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { LIMITS, type BoardSummary } from "@collab/shared";
 import { useOnConnected, useRequest, useServerEvents } from "@/lib/sync";
-import { Button, Input } from "./ui";
+import { Button, Input, useConfirm } from "./ui";
 
 export function BoardList() {
   const [boards, setBoards] = useState<BoardSummary[] | null>(null);
@@ -50,9 +50,21 @@ export function BoardList() {
     }
   }
 
+  const [confirm, confirmDialog] = useConfirm();
+
   async function remove(board: BoardSummary) {
-    if (!confirm(`Delete “${board.name}” and all its cards? This can't be undone.`)) return;
-    await request({ type: "delete_board", boardId: board.id });
+    const ok = await confirm({
+      title: "Delete board?",
+      message: (
+        <>
+          <strong>{board.name}</strong> and all its columns and cards will be deleted for everyone.
+          This can&apos;t be undone.
+        </>
+      ),
+      confirmLabel: "Delete board",
+      danger: true,
+    });
+    if (ok) await request({ type: "delete_board", boardId: board.id });
   }
 
   return (
@@ -103,6 +115,7 @@ export function BoardList() {
           ))}
         </ul>
       )}
+      {confirmDialog}
     </main>
   );
 }

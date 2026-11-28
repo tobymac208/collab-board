@@ -76,14 +76,10 @@ export const Card = z.object({
   title: z.string(),
   description: z.string(),
   position: z.string(),
-  /** Incremented by every change to the card. Edits say which version they started from. */
+  /** Incremented by every change to the card (moves, and text as it's saved). */
   version: z.number().int().min(0),
 });
 export type Card = z.infer<typeof Card>;
-
-/** Card fields that can be edited, and so can conflict. */
-export const CardField = z.enum(["title", "description"]);
-export type CardField = z.infer<typeof CardField>;
 
 // ---- field validators shared by HTTP and WebSocket requests ---------------
 

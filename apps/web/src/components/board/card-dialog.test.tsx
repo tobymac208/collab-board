@@ -1,113 +1,201 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import type { Card } from "@collab/shared";
+import {
+  applyUpdate,
+  cursorAt,
+  diffSince,
+  editText,
+  encodeStateVector,
+  fromBase64,
+  newCardDoc,
+  readText,
+  seedUpdate,
+  toBase64,
+  type Card,
+  type CardDoc,
+  type ServerEvent,
+} from "@collab/shared";
+import { CardDocs, LOCAL } from "@/lib/card-docs";
 import { BoardContext, type BoardContextValue } from "./board-context";
 import { CardDialog } from "./card-dialog";
+import { diffText } from "./crdt-field";
 
 beforeAll(() => {
-  // jsdom has <dialog> but not its modal API.
+  // jsdom has <dialog> but not its modal API, nor ResizeObserver.
   HTMLDialogElement.prototype.showModal ??= function (this: HTMLDialogElement) {
     this.open = true;
   };
   HTMLDialogElement.prototype.close ??= function (this: HTMLDialogElement) {
     this.open = false;
   };
+  globalThis.ResizeObserver ??= class {
+    observe() {}
+    disconnect() {}
+    unobserve() {}
+  } as unknown as typeof ResizeObserver;
 });
 afterEach(cleanup);
 
-const base: Card = {
-  id: "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a",
-  boardId: "b",
+const BOARD = "8d4b0f9e-4a6c-4b1e-9a57-2f3c1d0e5b6a";
+const card: Card = {
+  id: "1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
+  boardId: BOARD,
   columnId: "c",
-  title: "Original",
-  description: "original notes",
+  title: "Plan",
+  description: "",
   position: "a0",
-  version: 1,
+  version: 3,
 };
 
-function setup(mutate: BoardContextValue["mutate"] = vi.fn(async () => ({ ok: true as const }))) {
-  const ctx: BoardContextValue = { mutate, othersOnCard: () => [] };
-  const ui = (card: Card) => (
+/** Two browsers sharing one card through a stand-in server. */
+function twoBrowsers() {
+  const serverDoc: CardDoc = newCardDoc();
+  applyUpdate(serverDoc, seedUpdate("Plan", ""));
+  const all: CardDocs[] = [];
+  const connect = () => {
+    const docs: CardDocs = new CardDocs(
+      BOARD,
+      async (body) => {
+        if (body.type === "card_doc_open") {
+          return [
+            {
+              type: "card_doc_sync",
+              boardId: BOARD,
+              cardId: body.cardId,
+              update: toBase64(diffSince(serverDoc, fromBase64(body.stateVector))),
+              stateVector: toBase64(encodeStateVector(serverDoc)),
+            },
+          ];
+        }
+        if (body.type === "card_doc_update") applyUpdate(serverDoc, fromBase64(body.update));
+        if (body.type === "card_doc_update" || body.type === "card_awareness") {
+          for (const other of all) if (other !== docs) other.handle({ ...body } as ServerEvent);
+        }
+        return [];
+      },
+      () => {},
+    );
+    docs.setLive(true);
+    all.push(docs);
+    return docs;
+  };
+  return { mine: connect(), theirs: connect(), serverDoc };
+}
+
+function renderEditor(cardDocs: CardDocs, live = true) {
+  const ctx: BoardContextValue = {
+    mutate: vi.fn(async () => ({ ok: true as const })),
+    othersOnCard: () => [],
+    cardDocs,
+    live,
+    me: { name: "Me", color: "red" },
+  };
+  return render(
     <BoardContext value={ctx}>
       <CardDialog card={card} onClose={() => {}} />
-    </BoardContext>
+    </BoardContext>,
   );
-  const view = render(ui(base));
-  return { rerender: (card: Card) => view.rerender(ui(card)), mutate };
 }
 
 const title = () => screen.getByLabelText("Title") as HTMLInputElement;
-const description = () => screen.getByLabelText("Description") as HTMLTextAreaElement;
 
-describe("CardDialog while someone else edits", () => {
-  it("keeps what you typed when someone else saves the same field", () => {
-    const { rerender } = setup();
-    fireEvent.change(title(), { target: { value: "Mine" } });
-    rerender({ ...base, title: "Theirs", version: 2 });
-    expect(title().value).toBe("Mine");
+/** Opens the card in the other browser and waits until it has synced. */
+async function openTheirs(theirs: CardDocs) {
+  theirs.open(card.id);
+  await waitFor(() => expect(theirs.get(card.id)?.synced).toBe(true));
+  return theirs.get(card.id)!;
+}
+
+describe("diffText", () => {
+  it("finds the single edit between two strings", () => {
+    expect(diffText("hello", "help")).toEqual({ index: 3, deleteCount: 2, insert: "p" });
+    expect(diffText("abc", "abXc")).toEqual({ index: 2, deleteCount: 0, insert: "X" });
+    expect(diffText("aaa", "aa")).toEqual({ index: 2, deleteCount: 1, insert: "" });
+    expect(diffText("", "new")).toEqual({ index: 0, deleteCount: 0, insert: "new" });
   });
 
-  it("shows other people's edits live in fields you haven't touched", () => {
-    const { rerender } = setup();
-    fireEvent.change(title(), { target: { value: "Mine" } });
-    rerender({ ...base, description: "their notes", version: 2 });
-    expect(description().value).toBe("their notes");
-    expect(title().value).toBe("Mine");
+  it("never splits an emoji into halves", () => {
+    // 😀 and 😃 share their first UTF-16 half.
+    expect(diffText("a😀", "a😃")).toEqual({ index: 1, deleteCount: 2, insert: "😃" });
+    expect(diffText("😀b", "😃b")).toEqual({ index: 0, deleteCount: 2, insert: "😃" });
+    // Applying the edit gives exactly the entered text.
+    const apply = (s: string, d: ReturnType<typeof diffText>) =>
+      s.slice(0, d.index) + d.insert + s.slice(d.index + d.deleteCount);
+    for (const [before, after] of [
+      ["x😀y", "x😃y"],
+      ["👍🏽", "👍🏿"],
+      ["ab", "a😀b"],
+    ] as const) {
+      expect(apply(before, diffText(before, after))).toBe(after);
+    }
+  });
+});
+
+describe("live card editor", () => {
+  it("edits the card's shared document as you type", async () => {
+    const { mine, serverDoc } = twoBrowsers();
+    renderEditor(mine);
+    await waitFor(() => expect(title().value).toBe("Plan"));
+    fireEvent.change(title(), { target: { value: "Plan B" } });
+    await waitFor(() => expect(readText(serverDoc, "title")).toBe("Plan B"));
   });
 
-  it("still shows your text next to theirs after a conflict", async () => {
-    const mutate = vi.fn(async () => ({
-      ok: false as const,
-      error: Object.assign(new Error("conflict"), {
-        code: "conflict" as const,
-        conflictingFields: ["description" as const],
-      }),
-    }));
-    const { rerender } = setup(mutate as unknown as BoardContextValue["mutate"]);
-    fireEvent.change(description(), { target: { value: "my notes" } });
-    rerender({ ...base, description: "their notes", version: 2 });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    });
-    expect(screen.getByRole("alert").textContent).toContain("their notes");
-    expect(description().value).toBe("my notes");
+  it("shows someone else's typing live and keeps your cursor where it was", async () => {
+    const { mine, theirs } = twoBrowsers();
+    renderEditor(mine);
+    await waitFor(() => expect(title().value).toBe("Plan"));
+    const other = await openTheirs(theirs);
+
+    title().focus();
+    title().setSelectionRange(2, 2); // "Pl|an"
+    fireEvent.select(title());
+    act(() => editText(other.doc, "title", 0, 0, ">> ", LOCAL)); // typed in their browser
+    await waitFor(() => expect(title().value).toBe(">> Plan"));
+    expect(title().selectionStart).toBe(5); // still "Pl|an"
   });
 
-  it("reopens a refused edit with its text and clash, and reports when it's saved", async () => {
-    const mutate = vi.fn(async () => ({ ok: true as const, queued: true }));
-    const onSaved = vi.fn();
-    const ctx: BoardContextValue = {
-      mutate: mutate as unknown as BoardContextValue["mutate"],
-      othersOnCard: () => [],
-    };
-    render(
-      <BoardContext value={ctx}>
-        <CardDialog
-          card={{ ...base, description: "their notes", version: 3 }}
-          resume={{
-            drafts: { description: { value: "my offline notes", baseVersion: 1 } },
-            conflicts: ["description"],
-          }}
-          onSaved={onSaved}
-          onClose={() => {}}
-        />
-      </BoardContext>,
+  it("undoes only your own typing", async () => {
+    const { mine, theirs } = twoBrowsers();
+    renderEditor(mine);
+    await waitFor(() => expect(title().value).toBe("Plan"));
+    fireEvent.change(title(), { target: { value: "Plan mine" } });
+    const other = await openTheirs(theirs);
+    await waitFor(() => expect(readText(other.doc, "title")).toBe("Plan mine"));
+    act(() => editText(other.doc, "title", 0, 0, "theirs ", LOCAL));
+    await waitFor(() => expect(title().value).toBe("theirs Plan mine"));
+
+    fireEvent.keyDown(title(), { key: "z", ctrlKey: true });
+    await waitFor(() => expect(title().value).toBe("theirs Plan"));
+  });
+
+  it("is read-only offline for a card whose text was never opened here", () => {
+    const docs = new CardDocs(
+      BOARD,
+      async () => [],
+      () => {},
     );
-    expect(description().value).toBe("my offline notes");
-    expect(screen.getByRole("alert").textContent).toContain("their notes");
+    renderEditor(docs, false);
+    expect(screen.queryByLabelText("Title")).toBeNull();
+    expect(screen.getByText(/once you reconnect/)).toBeTruthy();
+    expect(screen.getByText("Plan")).toBeTruthy();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: "Keep mine" }));
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  it("shows other people's cursors with their names", async () => {
+    const { mine, theirs } = twoBrowsers();
+    renderEditor(mine);
+    await waitFor(() => expect(title().value).toBe("Plan"));
+    const other = await openTheirs(theirs);
+    act(() => {
+      other.awareness.setLocalState({
+        user: { name: "Bob", color: "blue" },
+        cursor: {
+          field: "title",
+          anchor: cursorAt(other.doc, "title", 2),
+          head: cursorAt(other.doc, "title", 2),
+        },
+      });
     });
-    expect(mutate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "update_card",
-        description: { value: "my offline notes", baseVersion: 3 },
-      }),
-      { quiet: true },
-    );
-    expect(onSaved).toHaveBeenCalledOnce();
+    await waitFor(() => expect(screen.getByText("Bob")).toBeTruthy());
   });
 });

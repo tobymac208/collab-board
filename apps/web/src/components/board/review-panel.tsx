@@ -26,10 +26,6 @@ export function describeOp(op: BoardOp, board: BoardState): string {
       return `Delete column ${column(op.columnId)}`;
     case "create_card":
       return `Add the card “${op.title}” to ${column(op.columnId)}`;
-    case "update_card": {
-      const fields = [op.title && "title", op.description && "description"].filter(Boolean);
-      return `Edit the ${fields.join(" and ")} of ${card(op.cardId)}`;
-    }
     case "move_card":
       return `Move ${card(op.cardId)} to ${column(op.toColumnId)}`;
     case "delete_card":
@@ -39,24 +35,16 @@ export function describeOp(op: BoardOp, board: BoardState): string {
 
 /** Why the server refused it, in terms the user can act on. */
 export function explainRejection(rejected: RejectedOp): string {
-  if (rejected.code === "conflict" && rejected.conflictingFields.length > 0) {
-    return `Someone else changed the ${rejected.conflictingFields.join(" and ")} meanwhile.`;
-  }
   if (rejected.code === "not_found") return "It was deleted by someone else meanwhile.";
   if (rejected.code === "forbidden") return "You no longer have permission to do that.";
   return rejected.message;
 }
 
-/** Card text clashes can be reopened in the editor; the card must still exist. */
-const canResolve = (rejected: RejectedOp, board: BoardState) =>
-  rejected.op.type === "update_card" &&
-  rejected.code === "conflict" &&
-  board.cards[rejected.op.cardId] !== undefined;
-
 /**
- * Changes made offline that the server refused once we reconnected. Nothing
- * is lost silently: each is listed with the reason, and card text clashes
- * can be reopened in the editor to choose between theirs and yours.
+ * Changes made offline that the server refused once we reconnected (moves
+ * and deletes of things others removed meanwhile, say). Nothing is lost
+ * silently: each is listed with the reason. Card text never ends up here,
+ * since it merges.
  */
 export function ReviewPanel({
   open,
@@ -64,14 +52,12 @@ export function ReviewPanel({
   rejected,
   board,
   onDismiss,
-  onResolve,
 }: {
   open: boolean;
   onClose: () => void;
   rejected: RejectedOp[];
   board: BoardState;
   onDismiss: (opId: string) => void;
-  onResolve: (rejected: RejectedOp) => void;
 }) {
   return (
     <Modal open={open && rejected.length > 0} onClose={onClose} title="Offline changes to review">
@@ -86,11 +72,6 @@ export function ReviewPanel({
               <p className="font-medium">{describeOp(r.op, board)}</p>
               <p className="text-zinc-500">{explainRejection(r)}</p>
             </div>
-            {canResolve(r, board) && (
-              <Button variant="secondary" onClick={() => onResolve(r)}>
-                Resolve
-              </Button>
-            )}
             <Button variant="ghost" onClick={() => onDismiss(r.op.opId)}>
               Discard
             </Button>
