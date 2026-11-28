@@ -63,11 +63,25 @@ export const diffSince = (doc: CardDoc, stateVector: Uint8Array): Uint8Array =>
 /**
  * Merges `update` into `doc`. Returns whether that changed anything: false
  * for an update the document already contained (a resend, or an echo).
+ *
+ * An update can arrive before one it depends on; Yjs then holds it as
+ * "pending" until the gap fills, so the visible snapshot doesn't change yet.
+ * That still counts as a change: the document now holds something new that
+ * must be saved and passed on, or it would be lost.
  */
 export function applyUpdate(doc: CardDoc, update: Uint8Array, origin?: unknown): boolean {
   const before = Y.snapshot(doc);
+  const pendingBefore = pendingSignature(doc);
   Y.applyUpdate(doc, update, origin);
-  return !Y.equalSnapshots(before, Y.snapshot(doc));
+  return !Y.equalSnapshots(before, Y.snapshot(doc)) || pendingSignature(doc) !== pendingBefore;
+}
+
+/** A summary of updates Yjs is holding until their dependencies arrive. */
+function pendingSignature(doc: CardDoc): string {
+  const { pendingStructs, pendingDs } = doc.store;
+  const structs = pendingStructs ? toBase64(pendingStructs.update) : "";
+  const deletes = pendingDs ? toBase64(pendingDs) : "";
+  return `${structs}|${deletes}`;
 }
 
 /** Combines several updates into one (e.g. a batch of keystrokes). */
@@ -114,8 +128,16 @@ export function isEmptyUpdate(update: Uint8Array): boolean {
 /** A cursor position in a text field, as JSON-friendly data for sending to others. */
 export type TextCursor = unknown;
 
+/**
+ * A cursor at `index`, attached to the character before it (or the start of
+ * the field). So when someone else types exactly where the cursor is, it
+ * stays after the person's own text instead of jumping past theirs; two
+ * people typing at the same spot each keep their words together.
+ */
 export function cursorAt(doc: CardDoc, field: CardTextField, index: number): TextCursor {
-  return Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(doc.getText(field), index));
+  return Y.relativePositionToJSON(
+    Y.createRelativePositionFromTypeIndex(doc.getText(field), index, -1),
+  );
 }
 
 /** Where a cursor is now, or null if it doesn't belong to this field. */
@@ -139,12 +161,26 @@ export interface TextUndo {
   destroy(): void;
 }
 
+/** Undo managers made by createUndo; their own changes count as local edits. */
+const undoManagers = new WeakSet<object>();
+
+/**
+ * Whether a change came from undo/redo. Yjs labels those changes with the
+ * undo manager itself rather than the origin of the typing being undone, so
+ * code that sends local edits must check for this too, or undo would only
+ * happen in this browser.
+ */
+export function isUndoOrigin(origin: unknown): boolean {
+  return typeof origin === "object" && origin !== null && undoManagers.has(origin);
+}
+
 /**
  * Undo/redo for one field, covering only changes made with `origin` (this
  * user's typing), so undo never removes someone else's text.
  */
 export function createUndo(doc: CardDoc, field: CardTextField, origin: unknown): TextUndo {
   const manager = new Y.UndoManager(doc.getText(field), { trackedOrigins: new Set([origin]) });
+  undoManagers.add(manager);
   return {
     undo: () => void manager.undo(),
     redo: () => void manager.redo(),

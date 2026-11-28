@@ -24,6 +24,7 @@ import {
   type TestClient,
   type TestServer,
 } from "../test/harness.ts";
+import { saveCardText } from "./card-docs.ts";
 
 const getDb = useTestDb();
 let server: TestServer;
@@ -104,6 +105,12 @@ async function edit(
   return updates;
 }
 
+/** Restarts the server with saves that only happen when the test flushes them. */
+async function useManualTextSaves() {
+  await server.close();
+  server = await startServer(getDb(), [], { cardTextSaveDelayMs: 60 * 60 * 1000 });
+}
+
 /** Waits for the next message of `type`. */
 async function nextOf<T extends ServerEvent["type"]>(client: TestClient, type: T) {
   for (;;) {
@@ -154,13 +161,16 @@ describe("card text documents", () => {
     expect(readText(a, "title")).toMatch(/^Plan( A B| B A)$/);
   });
 
-  it("refreshes the card's plain text shortly after, as a revisioned change", async () => {
+  it("refreshes the card's plain text after edits, as a revisioned change", async () => {
+    await useManualTextSaves();
     const { alice, bob, board, card } = await setup();
     const doc = await openDoc(alice, board.id, card.id);
     await edit(alice, doc, board.id, card.id, (d) => {
       editText(d, "title", 0, 4, "Roadmap");
       editText(d, "description", 0, 0, "Q1 goals");
     });
+    // Both updates are in before the save runs, so one save covers them.
+    await server.flushCardText();
 
     const saved = await nextOf(bob, "card_upserted");
     expect(saved.card).toMatchObject({ title: "Roadmap", description: "Q1 goals" });
@@ -174,6 +184,7 @@ describe("card text documents", () => {
   });
 
   it("batches a burst of edits into one plain-text save", async () => {
+    await useManualTextSaves();
     const { alice, bob, board, card } = await setup();
     const doc = await openDoc(alice, board.id, card.id);
     for (const ch of " one two") {
@@ -181,9 +192,29 @@ describe("card text documents", () => {
         editText(d, "title", readText(d, "title").length, 0, ch),
       );
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const saves = (await bob.drain()).filter((m) => m.type === "card_upserted");
-    expect(saves).toHaveLength(1);
+    await server.flushCardText();
+    await nextOf(bob, "card_upserted");
+    expect((await bob.drain()).filter((m) => m.type === "card_upserted")).toHaveLength(0);
+  });
+
+  it("retries a failed plain-text save until it works, with the latest text", async () => {
+    await server.close();
+    let fail = 2;
+    server = await startServer(getDb(), [], {
+      cardTextSaveDelayMs: 10,
+      saveCardText: async (db, cardId) => {
+        if (fail-- > 0) throw new Error("database briefly unavailable");
+        return saveCardText(db, cardId);
+      },
+    });
+    const { alice, bob, board, card } = await setup();
+    const doc = await openDoc(alice, board.id, card.id);
+    await edit(alice, doc, board.id, card.id, (d) => editText(d, "title", 0, 4, "Retried"));
+
+    const saved = await nextOf(bob, "card_upserted"); // after two failures
+    expect(saved.card.title).toBe("Retried");
+    const dirty = await server.db.selectFrom("card_docs").select("dirty").executeTakeFirst();
+    expect(dirty?.dirty).toBe(false);
   });
 
   it("ignores an update it already has", async () => {

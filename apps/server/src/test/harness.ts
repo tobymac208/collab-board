@@ -17,6 +17,8 @@ import { createTestDb } from "./pglite.ts";
 export interface TestServer {
   base: string;
   db: DB;
+  /** Saves card text copies now instead of waiting for their delay. */
+  flushCardText: () => Promise<void>;
   close: () => Promise<void>;
 }
 
@@ -45,7 +47,7 @@ export async function startServer(
   allowedOrigins: string[] = [],
   options: AppServerOptions = {},
 ): Promise<TestServer> {
-  const { http, wss } = createAppServer(
+  const { http, wss, flushCardText } = createAppServer(
     { port: 0, allowedOrigins, cookieSecure: false },
     db,
     // Quick card text saves, so tests don't wait a second for each.
@@ -56,6 +58,7 @@ export async function startServer(
   return {
     base: `127.0.0.1:${port}`,
     db,
+    flushCardText,
     close: async () => {
       for (const c of wss.clients) c.terminate();
       wss.close();

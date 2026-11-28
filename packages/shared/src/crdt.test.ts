@@ -5,6 +5,7 @@ import {
   cursorAt,
   cursorIndex,
   isEmptyUpdate,
+  isUndoOrigin,
   diffSince,
   editText,
   encodeState,
@@ -126,5 +127,51 @@ describe("card text CRDT", () => {
     expect(isEmptyUpdate(diffSince(a, encodeStateVector(b)))).toBe(true);
     editText(a, "title", 0, 0, "x");
     expect(isEmptyUpdate(diffSince(a, encodeStateVector(b)))).toBe(false);
+  });
+
+  it("counts an update that arrives before its dependency as a change", () => {
+    const origin = seeded("");
+    const writer = loadCardDoc(encodeState(origin));
+    const updates: Uint8Array[] = [];
+    onDocUpdate(writer, (u) => updates.push(u));
+    editText(writer, "title", 0, 0, "a");
+    editText(writer, "title", 1, 0, "b"); // depends on "a"
+    const receiver = loadCardDoc(encodeState(origin));
+    expect(applyUpdate(receiver, updates[1]!)).toBe(true); // held as pending, still new
+    expect(readText(receiver, "title")).toBe(""); // not visible yet
+    expect(applyUpdate(receiver, updates[1]!)).toBe(false); // already holding it
+    expect(applyUpdate(receiver, updates[0]!)).toBe(true);
+    expect(readText(receiver, "title")).toBe("ab"); // gap filled
+    // And the pending part survives being saved and reloaded.
+    const partial = loadCardDoc(encodeState(origin));
+    applyUpdate(partial, updates[1]!);
+    const reloaded = loadCardDoc(encodeState(partial));
+    applyUpdate(reloaded, updates[0]!);
+    expect(readText(reloaded, "title")).toBe("ab");
+  });
+
+  it("labels undo and redo changes so they can be sent as local edits", () => {
+    const doc = seeded("base");
+    const mine = Symbol("me");
+    const undo = createUndo(doc, "title", mine);
+    editText(doc, "title", 4, 0, "!", mine);
+    const origins: unknown[] = [];
+    onDocUpdate(doc, (_u, origin) => origins.push(origin));
+    undo.undo();
+    undo.redo();
+    expect(origins).toHaveLength(2);
+    expect(origins.every(isUndoOrigin)).toBe(true);
+    expect(isUndoOrigin(mine)).toBe(false);
+    expect(isUndoOrigin(null)).toBe(false);
+  });
+
+  it("keeps a cursor with its own text when someone types at the same spot", () => {
+    const doc = seeded("Plan");
+    const mine = cursorAt(doc, "title", 4); // typing at the end
+    const other = loadCardDoc(encodeState(doc));
+    editText(other, "title", 4, 0, " theirs");
+    applyUpdate(doc, diffSince(other, encodeStateVector(doc)));
+    expect(readText(doc, "title")).toBe("Plan theirs");
+    expect(cursorIndex(doc, "title", mine)).toBe(4); // still right after "Plan"
   });
 });

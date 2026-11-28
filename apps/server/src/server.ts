@@ -54,7 +54,12 @@ export interface AppServerOptions {
    * so idle sockets stop receiving broadcasts once their session ends.
    */
   sessionCheckIntervalMs?: number;
+  /** Replaces the card text save, so tests can make it fail. */
+  saveCardText?: typeof saveCardTextNow;
 }
+
+/** Longest wait between retries of a failed card text save. */
+const MAX_TEXT_RETRY_MS = 30_000;
 
 export const OUTDATED_CLIENT_MESSAGE =
   "This page is out of date. Reload it to keep editing; your board is safe.";
@@ -136,7 +141,11 @@ async function readJson<T>(req: IncomingMessage, schema: z.ZodType<T>): Promise<
 export function createAppServer(
   config: ServerConfig,
   db: DB,
-  { sessionCheckIntervalMs = 60_000, cardTextSaveDelayMs = 1_000 }: AppServerOptions = {},
+  {
+    sessionCheckIntervalMs = 60_000,
+    cardTextSaveDelayMs = 1_000,
+    saveCardText: saveCardTextStore = saveCardTextNow,
+  }: AppServerOptions = {},
 ): { http: Server; wss: WebSocketServer; hub: Hub; flushCardText: () => Promise<void> } {
   const isAllowedOrigin = (origin: string | undefined) =>
     config.allowedOrigins.length === 0 || (!!origin && config.allowedOrigins.includes(origin));
@@ -146,23 +155,43 @@ export function createAppServer(
   // ---- card text: refresh the plain-text copy shortly after edits ------------
 
   const textTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Failed saves in a row, per card, for backing off retries. */
+  const textFailures = new Map<string, number>();
+  let stopped = false;
 
+  function scheduleTextSave(cardId: string, delayMs: number): void {
+    clearTimeout(textTimers.get(cardId));
+    const timer = setTimeout(() => void saveCardText(cardId), delayMs);
+    timer.unref();
+    textTimers.set(cardId, timer);
+  }
+
+  /**
+   * Saves a card's plain-text copy. On failure the card stays dirty (the
+   * database still says so) and the save is retried with growing delays up
+   * to MAX_TEXT_RETRY_MS. Each attempt reads the document as it is then, so
+   * edits made meanwhile are included.
+   */
   async function saveCardText(cardId: string): Promise<void> {
     textTimers.delete(cardId);
     try {
-      const event = await saveCardTextNow(db, cardId);
+      const event = await saveCardTextStore(db, cardId);
+      textFailures.delete(cardId);
       if (event && "card" in event) hub.toBoard(event.card.boardId, event);
     } catch (err) {
-      console.error(`saving card ${cardId} text failed`, err);
+      const failures = (textFailures.get(cardId) ?? 0) + 1;
+      textFailures.set(cardId, failures);
+      const delay = Math.min(MAX_TEXT_RETRY_MS, cardTextSaveDelayMs * 2 ** failures);
+      console.error(
+        `saving card ${cardId} text failed (${failures} in a row); retrying in ${delay}ms`,
+        err,
+      );
+      // A newer edit may already have scheduled a save; that one will do.
+      if (!stopped && !textTimers.has(cardId)) scheduleTextSave(cardId, delay);
     }
   }
 
-  const saveCardTextSoon = (cardId: string) => {
-    clearTimeout(textTimers.get(cardId));
-    const timer = setTimeout(() => void saveCardText(cardId), cardTextSaveDelayMs);
-    timer.unref();
-    textTimers.set(cardId, timer);
-  };
+  const saveCardTextSoon = (cardId: string) => scheduleTextSave(cardId, cardTextSaveDelayMs);
 
   /** Saves every pending copy now (shutdown), and any left dirty by a crash. */
   async function flushCardText(): Promise<void> {
@@ -442,7 +471,11 @@ export function createAppServer(
     closeEndedSessions().catch((err: unknown) => console.error("session check failed", err));
   }, sessionCheckIntervalMs);
   sessionCheck.unref();
-  http.on("close", () => clearInterval(sessionCheck));
+  http.on("close", () => {
+    clearInterval(sessionCheck);
+    stopped = true;
+    for (const timer of textTimers.values()) clearTimeout(timer);
+  });
 
   return { http, wss, hub, flushCardText };
 }
