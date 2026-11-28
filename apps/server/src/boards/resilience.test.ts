@@ -254,3 +254,127 @@ describe("pruneHistory", () => {
     expect(await count("applied_ops")).toBe(1);
   });
 });
+
+describe("review fixes", () => {
+  it("treats the same opId racing on two boards like a later resend", async () => {
+    const { owner, client, column } = await setup();
+    const { board: other } = only(
+      await client.request({ type: "create_board", name: "Other" }),
+      "board_upserted",
+    );
+    const otherSnap = only(
+      await client.request({ type: "open_board", boardId: other.id }),
+      "board_snapshot",
+    );
+    const otherTab = await connect(owner.cookie);
+    const opId = randomUUID();
+    const [a, b] = await Promise.all([
+      client.request({ type: "create_card", columnId: column.id, title: "one", opId }),
+      otherTab.request({
+        type: "create_card",
+        columnId: otherSnap.columns[0]!.id,
+        title: "two",
+        opId,
+      }),
+    ]);
+    // Both answered with the single change that was applied; nothing failed.
+    expect(only(a, "card_upserted").card).toEqual(only(b, "card_upserted").card);
+    const cards = await server.db.selectFrom("cards").select("title").execute();
+    expect(cards.map((c) => c.title).filter((t) => t === "one" || t === "two")).toHaveLength(1);
+  });
+
+  it("answers duplicate deletes sent at once with the same result", async () => {
+    const { owner, client, column } = await setup();
+    const card = await addCard(client, column.id, "doomed");
+    const otherTab = await connect(owner.cookie);
+    const opId = randomUUID();
+    const [a, b] = await Promise.all([
+      client.request({ type: "delete_card", cardId: card.id, opId }),
+      otherTab.request({ type: "delete_card", cardId: card.id, opId }),
+    ]);
+    expect(only(a, "card_deleted").revision).toBe(only(b, "card_deleted").revision);
+  });
+
+  it("only catches a member up on history from when they joined", async () => {
+    const { client, board, snap, column } = await setup();
+    await addCard(client, column.id, "before you joined"); // snap.revision + 1
+    const late = await signup(server);
+    await client.request({ type: "add_member", boardId: board.id, email: late.user.email });
+    const joinedAt = snap.revision + 2;
+    await addCard(client, column.id, "after you joined");
+    const member = await connect(late.cookie);
+
+    // From before joining: a snapshot, never the old events.
+    const early = await member.request({
+      type: "open_board",
+      boardId: board.id,
+      sinceRevision: snap.revision,
+    });
+    expect(early.map((e) => e.type)).toEqual(["board_snapshot"]);
+
+    // From the join onwards: just the changes.
+    const later = await member.request({
+      type: "open_board",
+      boardId: board.id,
+      sinceRevision: joinedAt,
+    });
+    expect(later.map((e) => e.type)).toEqual(["card_upserted"]);
+  });
+
+  it("gives catch-up renames the reader's own role", async () => {
+    const { client, board, column } = await setup();
+    const editor = await signup(server);
+    await client.request({ type: "add_member", boardId: board.id, email: editor.user.email });
+    const member = await connect(editor.cookie);
+    const { revision } = only(
+      await member.request({ type: "open_board", boardId: board.id }),
+      "board_snapshot",
+    );
+    await client.request({ type: "rename_board", boardId: board.id, name: "Renamed" });
+    await addCard(client, column.id, "x");
+    const events = await member.request({
+      type: "open_board",
+      boardId: board.id,
+      sinceRevision: revision,
+    });
+    expect(only(events, "board_upserted").board).toEqual({
+      id: board.id,
+      name: "Renamed",
+      role: "editor",
+    });
+  });
+
+  it("treats uppercase ids like their lowercase form", async () => {
+    const { owner, client, board, column } = await setup();
+    const watcher = await connect(owner.cookie);
+    await watcher.request({ type: "open_board", boardId: board.id.toUpperCase() });
+    await watcher.drain();
+    const card = only(
+      await client.request({
+        type: "create_card",
+        columnId: column.id.toUpperCase(),
+        title: "shouting",
+      }),
+      "card_upserted",
+    ).card;
+    expect(card.boardId).toBe(board.id);
+    expect(card.columnId).toBe(column.id);
+    // The uppercase subscription still receives the board's changes.
+    expect((await watcher.drain()).map((m) => m.type)).toContain("card_upserted");
+  });
+
+  it("tells an out-of-date tab to reload instead of showing a schema error", async () => {
+    const { client, column } = await setup();
+    client.ws.send(
+      JSON.stringify({ type: "create_card", requestId: "legacy", columnId: column.id, title: "x" }),
+    );
+    for (;;) {
+      const msg = await client.next();
+      if (msg.type === "error") {
+        expect(msg).toMatchObject({ requestId: "legacy", code: "bad_message" });
+        expect(msg.message).toMatch(/reload/i);
+        break;
+      }
+    }
+  });
+});

@@ -32,8 +32,17 @@ describe("parseClientMessage", () => {
     ).toBe(true);
     expect(parseClientMessage(raw({ type: "open_board", requestId: "r", boardId })).ok).toBe(true);
     expect(
-      parseClientMessage(raw({ type: "open_board", requestId: "r", boardId, sinceRevision: 7 })).ok,
-    ).toBe(true);
+      parseClientMessage(raw({ type: "open_board", requestId: "r", boardId, sinceRevision: 7 })),
+    ).toEqual({
+      ok: true,
+      value: { type: "open_board", requestId: "r", boardId, sinceRevision: 7 },
+    });
+  });
+
+  it("normalises ids to lowercase", () => {
+    const upper = "8D4B0F9E-4A6C-4B1E-9A57-2F3C1D0E5B6A";
+    const parsed = parseClientMessage(raw({ type: "open_board", requestId: "r", boardId: upper }));
+    expect(parsed).toMatchObject({ ok: true, value: { boardId: upper.toLowerCase() } });
   });
 
   it("rejects unknown message types", () => {

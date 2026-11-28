@@ -50,6 +50,32 @@ export interface AppServerOptions {
   sessionCheckIntervalMs?: number;
 }
 
+export const OUTDATED_CLIENT_MESSAGE =
+  "This page is out of date. Reload it to keep editing; your board is safe.";
+
+/** Board change types that require an opId since protocol v5. */
+const CHANGE_TYPES = new Set([
+  "rename_board",
+  "create_column",
+  "rename_column",
+  "move_column",
+  "delete_column",
+  "create_card",
+  "update_card",
+  "move_card",
+  "delete_card",
+]);
+
+/** A board change from a client older than protocol v5 (no opId). */
+function isLegacyChange(raw: string): boolean {
+  try {
+    const msg = JSON.parse(raw) as { type?: unknown; opId?: unknown } | null;
+    return typeof msg?.type === "string" && CHANGE_TYPES.has(msg.type) && msg.opId === undefined;
+  } catch {
+    return false;
+  }
+}
+
 function send(socket: WebSocket, message: ServerMessage): void {
   if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message));
 }
@@ -282,7 +308,9 @@ export function createAppServer(
           type: "error",
           ...(requestId ? { requestId } : {}),
           code: "bad_message",
-          message: parsed.error,
+          // A tab still running an older version of the app sends board
+          // changes without an opId. Tell the person what to do about it.
+          message: isLegacyChange(raw) ? OUTDATED_CLIENT_MESSAGE : parsed.error,
         });
         return;
       }

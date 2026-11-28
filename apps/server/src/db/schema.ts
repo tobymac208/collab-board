@@ -62,6 +62,9 @@ export interface CardsTable {
   /** The card version at which each editable field last changed. */
   title_version: ColumnType<number, never, number>;
   description_version: ColumnType<number, never, number>;
+  /** Who made each field's latest change (null if unknown or the user was deleted). */
+  title_changed_by: ColumnType<string | null, never, string>;
+  description_changed_by: ColumnType<string | null, never, string>;
   created_at: CreatedAt;
   updated_at: Timestamp;
 }

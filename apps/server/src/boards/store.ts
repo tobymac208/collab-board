@@ -205,8 +205,48 @@ async function writeBoard<T>(
 ): Promise<BoardWrite<T>> {
   const earlier = await findApplied(db, actor);
   if (earlier) return earlier;
-  const boardId = typeof target === "string" ? target : await target();
 
+  let boardId: string;
+  try {
+    boardId = typeof target === "string" ? target : await target();
+  } catch (err) {
+    // A resent delete can race the original: by the time we look the card up,
+    // the original has just deleted it. That's a replay, not "not found".
+    if (err instanceof StoreError && err.code === "not_found") {
+      const replay = await findApplied(db, actor);
+      if (replay) return replay;
+    }
+    throw err;
+  }
+
+  try {
+    return await applyWrite(db, actor, boardId, opts, change, toEvent);
+  } catch (err) {
+    // The same opId sent for two different boards at once: both got past the
+    // checks (they lock different boards) and the loser's applied_ops insert
+    // hit the key. Answer exactly as if it had arrived after the winner.
+    if (isDuplicateOpId(err)) {
+      const winner = await findApplied(db, actor);
+      if (winner) return winner;
+    }
+    throw err;
+  }
+}
+
+/** A unique-key violation on applied_ops, i.e. this opId was just recorded. */
+function isDuplicateOpId(err: unknown): boolean {
+  const e = err as { code?: string; constraint?: string } | null;
+  return e?.code === "23505" && e.constraint === "applied_ops_pkey";
+}
+
+async function applyWrite<T>(
+  db: DB,
+  actor: Actor,
+  boardId: string,
+  opts: { owner?: boolean },
+  change: (trx: DB, board: BoardSummary, boardId: string) => Promise<T>,
+  toEvent: (value: T, revision: number, boardId: string) => BoardChangeEvent,
+): Promise<BoardWrite<T>> {
   return db.transaction().execute(async (trx) => {
     const { revision: _before, ...board } = await requireMember(trx, actor.userId, boardId, {
       ...opts,
@@ -406,6 +446,14 @@ export const MAX_CATCH_UP = 500;
  * Every change to a board after `sinceRevision`, in order, or null if the
  * log can't provide all of them (pruned, too many, or a client claiming a
  * revision the board never reached). Null means: send a snapshot.
+ *
+ * Access policy: a member sees history only from when they joined. Asking
+ * for changes from before then gets null (a snapshot), which shows the board
+ * as it is now, exactly what a new member's first load shows. Older titles
+ * and descriptions in the log stay out of reach.
+ *
+ * Board renames are returned with the reader's own role, matching what the
+ * live broadcast sends them (the log stores the owner's).
  */
 export async function getChangesSince(
   db: DB,
@@ -417,13 +465,19 @@ export async function getChangesSince(
     .transaction()
     .setIsolationLevel("repeatable read")
     .execute(async (trx) => {
-      const { revision } = await requireMember(trx, userId, boardId);
+      const { revision, role } = await requireMember(trx, userId, boardId);
       const missing = revision - sinceRevision;
       if (missing < 0 || missing > MAX_CATCH_UP) return null;
       if (missing === 0) return [];
+      const { created_at: joinedAt } = await trx
+        .selectFrom("board_members")
+        .select("created_at")
+        .where("board_id", "=", boardId)
+        .where("user_id", "=", userId)
+        .executeTakeFirstOrThrow();
       const rows = await trx
         .selectFrom("board_changes")
-        .select(["revision", "event"])
+        .select(["revision", "event", "created_at"])
         .where("board_id", "=", boardId)
         .where("revision", ">", sinceRevision)
         .where("revision", "<=", revision)
@@ -431,7 +485,12 @@ export async function getChangesSince(
         .execute();
       // Revisions are gap-free, so a complete answer has exactly one row each.
       if (rows.length !== missing || rows[0]?.revision !== sinceRevision + 1) return null;
-      return rows.map((r) => r.event);
+      // Joining is itself logged (member_added) in the same transaction, so
+      // its timestamp equals joinedAt and the member's own join is included.
+      if (rows[0].created_at < joinedAt) return null;
+      return rows.map(({ event }) =>
+        event.type === "board_upserted" ? { ...event, board: { ...event.board, role } } : event,
+      );
     });
 }
 
@@ -535,11 +594,12 @@ export async function renameColumn(
     actor,
     boardOfColumn(db, columnId),
     {},
-    async (trx) => {
+    async (trx, _board, boardId) => {
       const row = await trx
         .updateTable("board_columns")
         .set({ name })
         .where("id", "=", columnId)
+        .where("board_id", "=", boardId)
         .returning(COLUMN_FIELDS)
         .executeTakeFirst();
       if (!row) throw new StoreError("not_found", "column not found");
@@ -573,6 +633,7 @@ export async function moveColumn(
         .updateTable("board_columns")
         .set({ position: positionBetweenNeighbours(siblings, afterId, beforeId) })
         .where("id", "=", columnId)
+        .where("board_id", "=", boardId)
         .returning(COLUMN_FIELDS)
         .executeTakeFirst();
       if (!row) throw new StoreError("not_found", "column not found");
@@ -592,10 +653,11 @@ export async function deleteColumn(
     actor,
     boardOfColumn(db, columnId),
     {},
-    async (trx) => {
+    async (trx, _board, boardId) => {
       const row = await trx
         .deleteFrom("board_columns")
         .where("id", "=", columnId)
+        .where("board_id", "=", boardId)
         .returning(COLUMN_FIELDS)
         .executeTakeFirst();
       if (!row) throw new StoreError("not_found", "column not found");
@@ -631,7 +693,10 @@ export async function createCard(
     boardOfColumn(db, columnId),
     {},
     async (trx, _board, boardId) => {
-      await findColumn(trx, columnId); // still there?
+      // Still there, and on the board we locked?
+      if ((await findColumn(trx, columnId)).board_id !== boardId) {
+        throw new StoreError("not_found", "column not found");
+      }
       const siblings = await trx
         .selectFrom("cards")
         .select(["id", "position"])
@@ -670,17 +735,28 @@ export async function updateCard(
     actor,
     boardOfCard(db, cardId),
     {},
-    async (trx) => {
+    async (trx, _board, boardId) => {
       // The board lock taken by writeBoard keeps this row stable until commit.
       const current = await trx
         .selectFrom("cards")
-        .select([...CARD_FIELDS, "title_version", "description_version"])
+        .select([
+          ...CARD_FIELDS,
+          "title_version",
+          "description_version",
+          "title_changed_by",
+          "description_changed_by",
+        ])
         .where("id", "=", cardId)
+        .where("board_id", "=", boardId)
         .executeTakeFirst();
       if (!current) throw new StoreError("not_found", "card not found");
       const fieldVersion = {
         title: current.title_version,
         description: current.description_version,
+      };
+      const changedBy = {
+        title: current.title_changed_by,
+        description: current.description_changed_by,
       };
 
       const changed: CardField[] = [];
@@ -688,7 +764,10 @@ export async function updateCard(
       for (const field of ["title", "description"] as const) {
         const change = edit[field];
         if (!change || change.value === current[field]) continue; // nothing to do
-        if (fieldVersion[field] > change.baseVersion) conflicts.push(field);
+        // Changed since this edit started, by someone else? Our own earlier
+        // edit (say, an earlier one queued offline) isn't a conflict.
+        const changedByOther = changedBy[field] !== actor.userId;
+        if (fieldVersion[field] > change.baseVersion && changedByOther) conflicts.push(field);
         else changed.push(field);
       }
       if (conflicts.length > 0) {
@@ -707,13 +786,18 @@ export async function updateCard(
           version,
           updated_at: new Date(),
           ...(changed.includes("title")
-            ? { title: edit.title!.value, title_version: version }
+            ? { title: edit.title!.value, title_version: version, title_changed_by: actor.userId }
             : {}),
           ...(changed.includes("description")
-            ? { description: edit.description!.value, description_version: version }
+            ? {
+                description: edit.description!.value,
+                description_version: version,
+                description_changed_by: actor.userId,
+              }
             : {}),
         })
         .where("id", "=", cardId)
+        .where("board_id", "=", boardId)
         .returning(CARD_FIELDS)
         .executeTakeFirstOrThrow();
       return toCard(row);
@@ -754,6 +838,7 @@ export async function moveCard(
           updated_at: new Date(),
         })
         .where("id", "=", cardId)
+        .where("board_id", "=", boardId)
         .returning(CARD_FIELDS)
         .executeTakeFirst();
       if (!row) throw new StoreError("not_found", "card not found"); // deleted meanwhile
@@ -769,10 +854,11 @@ export async function deleteCard(db: DB, actor: Actor, cardId: string): Promise<
     actor,
     boardOfCard(db, cardId),
     {},
-    async (trx) => {
+    async (trx, _board, boardId) => {
       const row = await trx
         .deleteFrom("cards")
         .where("id", "=", cardId)
+        .where("board_id", "=", boardId)
         .returning(CARD_FIELDS)
         .executeTakeFirst();
       if (!row) throw new StoreError("not_found", "card not found");
